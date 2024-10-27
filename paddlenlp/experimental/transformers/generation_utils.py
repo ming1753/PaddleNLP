@@ -22,6 +22,12 @@ from paddlenlp.generation import GenerationMixin, LogitsProcessor, LogitsProcess
 
 __all__ = ["GenerationInferenceModel", "GenerationBlockInferenceModel", "GenerationAvxInferenceModel"]
 
+def TopKProcess(probs: paddle.Tensor, top_k: int, min_tokens_to_keep: int):
+    top_k = min(max(top_k, min_tokens_to_keep), probs.shape[-1])
+    topk_probs, _ = paddle.topk(probs, k=top_k)
+    probs = paddle.where(probs >= topk_probs[:, -1:], probs, paddle.full_like(probs, -float("inf")))
+    return probs
+
 
 class ForcedDecodingEOSTokenLogitsProcessor(LogitsProcessor):
     """
@@ -327,6 +333,8 @@ class GenerationInferenceModel(GenerationMixin):
             logits = logits / temperature
 
             # sample
+            if self.config.top_k is not None and self.config.top_k != 0:
+                 logits = TopKProcess(logits, self.config.top_k, min_tokens_to_keep)
             probs = F.softmax(logits)
 
             # compute next_tokens
@@ -671,6 +679,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
             )
 
             # sample
+            if self.config.top_k is not None and self.config.top_k != 0:
+                logits = TopKProcess(logits, self.config.top_k, min_tokens_to_keep)
             probs = F.softmax(logits)
 
             # compute next_tokens
