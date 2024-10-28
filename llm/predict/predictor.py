@@ -139,7 +139,7 @@ class PredictorArgument:
         if self.device == "npu":
             return self.src_length + self.max_length
         else:
-            return 8192  # Maximum sequence length.
+            return 4096  # Maximum sequence length.
 
     def __post_init__(self):
         if self.append_attn:
