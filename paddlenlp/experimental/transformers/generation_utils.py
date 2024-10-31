@@ -279,6 +279,7 @@ class GenerationInferenceModel(GenerationMixin):
         top_p=None,
         temperature=None,
         inputs_embeds=None,
+        min_tokens_to_keep=1,
         **model_kwargs,
     ):
         step_idx_ori = paddle.full(shape=[1], dtype="int64", fill_value=1)
