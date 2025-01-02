@@ -1067,11 +1067,7 @@ class FusedMultiTransformerBase(Layer):
 
         residual_input = src
         for i in range(self.num_layers):
-            # qkv_out, residual_input = self.compute_qkv(src, residual_input, i)
-            ln_out = self.compute_layernorm_before_qkv(src, i)
-            # import pdb;pdb.set_trace()
-            qkv_out = self.compute_qkv_linear(ln_out, i)
-            # import pdb;pdb.set_trace()
+            qkv_out, residual_input = self.compute_qkv(src, residual_input, i)
             out_linear_out = self.compute_attn(
                 time_step,
                 qkv_out,
@@ -1087,7 +1083,6 @@ class FusedMultiTransformerBase(Layer):
                 i,
                 **kwargs,
             )
-            # import pdb;pdb.set_trace()
             # all_reduce
             if self.nranks > 1:
                 dist.all_reduce(out_linear_out)
@@ -1127,9 +1122,6 @@ class FusedMultiTransformerBase(Layer):
         kwargs["input_ids"] = input_ids
 
         out = self.post_process(**kwargs)
-        import pdb
-
-        pdb.set_trace()
         return out, caches
 
 
@@ -2297,7 +2289,6 @@ class FusedBlockMultiTransformer(FusedMultiTransformerBase):
                     rope_theta=self.config.rope_theta,
                 )[0]
 
-        # import pdb;pdb.set_trace()
         out_linear_out = self.compute_out_linear(fmha_out, i)
 
         return out_linear_out
@@ -3112,7 +3103,7 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
     #     out_scale = paddle.cast(out_scale, "float32")
     #     return quant_tensor, out_scale
 
-    def quant_pretokken(self, inputs, weight_scale):
+    def quant_pertensor(self, inputs, weight_scale):
         scales = paddle.max(paddle.abs(inputs))
         scales = paddle.where(
             scales == paddle.to_tensor(0, dtype="bfloat16"), paddle.to_tensor(1e-8, dtype="bfloat16"), scales
@@ -3470,11 +3461,8 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
         residual_input = src
         for i in range(self.num_layers):
             ln_out = self.compute_layernorm_before_qkv(src, i)
-            # import pdb;pdb.set_trace()
-            ln_out, self.qkv_out_scale = self.quant_pretokken(ln_out, self.weight_scales["qkv_weight_scale"][i])
-            # import pdb;pdb.set_trace()
+            ln_out, self.qkv_out_scale = self.quant_pertensor(ln_out, self.weight_scales["qkv_weight_scale"][i])
             qkv_out = self.compute_qkv_linear(ln_out, i)
-            # import pdb;pdb.set_trace()
             atten_out = self.compute_attn(
                 time_step,
                 qkv_out,
@@ -3490,8 +3478,7 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
                 i,
                 **kwargs,
             )
-            # import pdb;pdb.set_trace()
-            atten_out, self.linear_out_scale = self.quant_pretokken(
+            atten_out, self.linear_out_scale = self.quant_pertensor(
                 atten_out, self.weight_scales["out_linear_weight_scale"][i]
             )
             out_linear_out = self.compute_out_linear(atten_out, i)
@@ -3502,7 +3489,7 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
             # ffn layernorm
             tmp_out, residual_input = self.compute_ffn_layernorm(out_linear_out, residual_input, i)
 
-            tmp_out, self.ffn1_out_scale = self.quant_pretokken(tmp_out, self.weight_scales["ffn1_weight_scale"][i])
+            tmp_out, self.ffn1_out_scale = self.quant_pertensor(tmp_out, self.weight_scales["ffn1_weight_scale"][i])
 
             if self.config.moe_config.use_moe(i):
                 # fused moe
@@ -3517,7 +3504,7 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
                 ffn1_out = self.compute_ffn1(tmp_out, i)
                 ffn1_out = self.compute_activation(ffn1_out, i)
 
-                ffn1_out, self.ffn2_out_scale = self.quant_pretokken(
+                ffn1_out, self.ffn2_out_scale = self.quant_pertensor(
                     ffn1_out, self.weight_scales["ffn2_weight_scale"][i]
                 )
                 # ffn2 matmul
@@ -3539,5 +3526,4 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
         kwargs["input_ids"] = input_ids
 
         out = self.post_process(**kwargs)
-        # import pdb;pdb.set_trace()
         return out, caches
