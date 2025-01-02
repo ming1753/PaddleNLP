@@ -85,6 +85,7 @@ __all__ = [
     "FusedBlockMultiTransformerWeightOnly",
     "FusedBlockMultiTransformerA8W8",
     "FusedBlockMultiTransformerFP8",
+    "FusedBlockMultiTransformerA8W8DynamicQuant",
 ]
 
 
@@ -1066,7 +1067,11 @@ class FusedMultiTransformerBase(Layer):
 
         residual_input = src
         for i in range(self.num_layers):
-            qkv_out, residual_input = self.compute_qkv(src, residual_input, i)
+            # qkv_out, residual_input = self.compute_qkv(src, residual_input, i)
+            ln_out = self.compute_layernorm_before_qkv(src, i)
+            # import pdb;pdb.set_trace()
+            qkv_out = self.compute_qkv_linear(ln_out, i)
+            # import pdb;pdb.set_trace()
             out_linear_out = self.compute_attn(
                 time_step,
                 qkv_out,
@@ -1082,6 +1087,7 @@ class FusedMultiTransformerBase(Layer):
                 i,
                 **kwargs,
             )
+            # import pdb;pdb.set_trace()
             # all_reduce
             if self.nranks > 1:
                 dist.all_reduce(out_linear_out)
@@ -1121,6 +1127,9 @@ class FusedMultiTransformerBase(Layer):
         kwargs["input_ids"] = input_ids
 
         out = self.post_process(**kwargs)
+        import pdb
+
+        pdb.set_trace()
         return out, caches
 
 
@@ -2288,6 +2297,7 @@ class FusedBlockMultiTransformer(FusedMultiTransformerBase):
                     rope_theta=self.config.rope_theta,
                 )[0]
 
+        # import pdb;pdb.set_trace()
         out_linear_out = self.compute_out_linear(fmha_out, i)
 
         return out_linear_out
@@ -2928,3 +2938,608 @@ class FusedBlockMultiTransformerFP8(FusedBlockMultiTransformer):
                 residual=residual_input,
             )[0]
         return tmp_out, residual_input
+
+
+class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
+    def __init__(self, config: FusedMultiTransformerConfig):
+        super().__init__(config)
+        self.quant_round_type = config.quant_round_type
+        self.quant_max_bound = config.quant_max_bound
+        self.quant_min_bound = config.quant_min_bound
+        self.use_gemm_dequant = False
+
+        self.linear_shifts, self.linear_smooths, self.ffn2_shifts, self.ffn2_smooths = [], [], [], []
+
+        for i in range(self.num_layers):
+            linear_shift_attr = self.get_attr(config.linear_shift_attrs, i)
+            linear_smooth_attr = self.get_attr(config.linear_smooth_attrs, i)
+            ffn2_shift_attr = self.get_attr(config.ffn2_shift_attrs, i)
+            ffn2_smooth_attr = self.get_attr(config.ffn2_smooth_attrs, i)
+
+            linear_shift = None
+            if linear_shift_attr:
+                linear_shift = self.create_parameter(
+                    shape=[self.num_heads * self.head_dim], attr=linear_shift_attr, dtype=self._dtype, is_bias=False
+                )
+
+            linear_smooth = None
+            if linear_smooth_attr:
+                linear_smooth = self.create_parameter(
+                    shape=[self.num_heads * self.head_dim], attr=linear_smooth_attr, dtype=self._dtype, is_bias=False
+                )
+
+            ffn2_shift = None
+            if ffn2_shift_attr:
+                ffn2_shift = self.create_parameter(
+                    shape=[self.dim_feedforward], attr=ffn2_shift_attr, dtype=self._dtype, is_bias=False
+                )
+
+            ffn2_smooth = None
+            if ffn2_smooth_attr:
+                ffn2_smooth = self.create_parameter(
+                    shape=[self.dim_feedforward], attr=ffn2_smooth_attr, dtype=self._dtype, is_bias=False
+                )
+
+            if linear_shift is not None:
+                self.linear_shifts.append(linear_shift)
+                self.linear_smooths.append(linear_smooth)
+                self.ffn2_shifts.append(ffn2_shift)
+                self.ffn2_smooths.append(ffn2_smooth)
+
+            self._add_parameter(linear_shift)
+            self._add_parameter(linear_smooth)
+            self._add_parameter(ffn2_shift)
+            self._add_parameter(ffn2_smooth)
+
+    def init_weight(self):
+        self.qkv_weights = []
+        self.linear_weights = []
+        self.gate_weights = []
+        self.ffn1_weights = []
+        self.ffn2_weights = []
+
+        for i in range(self.num_layers):
+            qkv_weight_attr = self.get_attr(self.config.qkv_weight_attrs, i)
+            linear_weight_attr = self.get_attr(self.config.linear_weight_attrs, i)
+            gate_weight_attr = self.get_attr(self.config.gate_weight_attrs, i)
+            ffn1_weight_attr = self.get_attr(self.config.ffn1_weight_attrs, i)
+            ffn2_weight_attr = self.get_attr(self.config.ffn2_weight_attrs, i)
+
+            qkv_weight = self.create_parameter(
+                shape=self.qkv_weight_shape,
+                attr=qkv_weight_attr,
+                dtype=self.get_weight_create_dype("qkv_weight_scale", i),
+                is_bias=False,
+            )
+            linear_weight = self.create_parameter(
+                shape=self.linear_weight_shape,
+                attr=linear_weight_attr,
+                dtype=self.get_weight_create_dype("out_linear_weight_scale", i),
+                is_bias=False,
+            )
+
+            gate_weight = None
+
+            if self.config.moe_config.use_moe(i):
+                gate_weight = self.create_parameter(
+                    shape=[self.config.embed_dim, self.config.moe_config.num_experts],
+                    attr=gate_weight_attr,
+                    dtype="float32",
+                    is_bias=False,
+                    default_initializer=paddle.nn.initializer.Constant(0),
+                )
+
+            if self.config.moe_config.use_moe(i):
+                ffn1_weight = self.create_parameter(
+                    shape=self.moe_ffn1_weight_shape,
+                    attr=ffn1_weight_attr,
+                    dtype=self.create_params_type,
+                    is_bias=False,
+                )
+            else:
+                ffn1_weight = self.create_parameter(
+                    shape=self.ffn1_weight_shape,
+                    attr=ffn1_weight_attr,
+                    dtype=self.get_weight_create_dype("ffn1_weight_scale", i),
+                    is_bias=False,
+                )
+            if self.config.moe_config.use_moe(i):
+                ffn2_weight = self.create_parameter(
+                    shape=self.moe_ffn2_weight_shape,
+                    attr=ffn2_weight_attr,
+                    dtype=self.create_params_type,
+                    is_bias=False,
+                )
+            else:
+                ffn2_weight = self.create_parameter(
+                    shape=self.ffn2_weight_shape,
+                    attr=ffn2_weight_attr,
+                    dtype=self.get_weight_create_dype("ffn2_weight_scale", i),
+                    is_bias=False,
+                )
+
+            # tensor model parallel
+            if self.config.nranks > 1:
+                # column parallel
+                _set_var_distributed(qkv_weight)
+                _set_var_distributed(ffn1_weight)
+                # row parallel
+                _set_var_distributed(linear_weight)
+                _set_var_distributed(ffn2_weight)
+
+            self.qkv_weights.append(qkv_weight)
+            self.linear_weights.append(linear_weight)
+
+            if gate_weight is not None:
+                self.gate_weights.append(gate_weight)
+            self.ffn1_weights.append(ffn1_weight)
+            self.ffn2_weights.append(ffn2_weight)
+
+            self._add_parameter(qkv_weight)
+            self._add_parameter(linear_weight)
+            if gate_weight is not None:
+                self._add_parameter(gate_weight)
+            self._add_parameter(ffn1_weight)
+            self._add_parameter(ffn2_weight)
+
+    def skip_quant(self, layer_name, layer_idx):
+        """
+        Determine whether to skip quantization for a given layer based on weight scales.
+
+        Parameters:
+        - layer_name (str): The name of the layer to check.
+        - layer_idx (int): The index of the specific layer to check.
+
+        Returns:
+        - bool: True if quantization should be skipped, False otherwise.
+        """
+        return hasattr(self, "weight_scales") and np.all(self.weight_scales[layer_name][layer_idx] == -1)
+
+    def get_weight_create_dype(self, layer_name=None, layer_idx=None):
+        if layer_name is not None and layer_idx is not None:
+            if self.skip_quant(layer_name, layer_idx):
+                return self._dtype
+        return "int8"
+
+    # def quant_pretokken(self, inputs, weight_scale):
+    #     scales = paddle.max(paddle.abs(inputs), axis=-1, keepdim=True)
+    #     scales = paddle.where(scales == paddle.to_tensor(0, dtype="bfloat16"),
+    #                                 paddle.to_tensor(1e-8, dtype="bfloat16"), scales)
+    #     quant_tensor = paddle.clip(paddle.round(inputs / scales * 127.0), -127.0, 127.0)
+    #     quant_tensor = paddle.cast(quant_tensor, "int8")
+    #     # dequant_tensor = quant_tensor * scales / 127.0
+    #     out_scale = (weight_scale * scales) / (127.0 * 127.0)
+    #     out_scale = paddle.cast(out_scale, "float32")
+    #     return quant_tensor, out_scale
+
+    def quant_pretokken(self, inputs, weight_scale):
+        scales = paddle.max(paddle.abs(inputs))
+        scales = paddle.where(
+            scales == paddle.to_tensor(0, dtype="bfloat16"), paddle.to_tensor(1e-8, dtype="bfloat16"), scales
+        )
+        quant_tensor = paddle.clip(paddle.round(inputs / scales * 127.0), -127.0, 127.0)
+        quant_tensor = paddle.cast(quant_tensor, "int8")
+        # dequant_tensor = quant_tensor * scales / 127.0
+        out_scale = (weight_scale * scales) / (127.0 * 127.0)
+        out_scale = paddle.cast(out_scale, "float32")
+        return quant_tensor, out_scale
+
+    def init_weight_shape(self, config):
+        super().init_weight_shape(config)
+
+        if not paddle.is_compiled_with_rocm():
+            self.linear_weight_shape = [self.embed_dim, self.num_heads * self.head_dim]
+            self.ffn1_weight_shape = (
+                [self.dim_feedforward * 2, self.embed_dim]
+                if self.activation.endswith("glu")
+                else [self.dim_feedforward, self.embed_dim]
+            )
+            self.ffn2_weight_shape = [self.embed_dim, self.dim_feedforward]
+
+    def compute_layernorm_before_qkv(self, src, i):
+        if i == 0:
+            ln_out = self.norm_func(src, self.ln_scales[i], self.ln_biases[i], self._epsilon, begin_norm_axis=1)[0]
+        else:
+            ln_out = src
+
+        return ln_out
+
+    def compute_qkv_linear(self, ln_out, i):
+        if paddle.is_compiled_with_rocm():
+            qkv_out = paddle.matmul(ln_out, self.qkv_weights[i])
+        else:
+            qkv_out = paddle.matmul(ln_out, self.qkv_weights[i], False, True)
+        return qkv_out
+
+    def compute_attn(
+        self,
+        time_step,
+        qkv_out,
+        padding_offset,
+        seq_lens,
+        input_ids,
+        rotary_embs,
+        rotary_emb_dims,
+        caches,
+        pre_caches,
+        pre_caches_length,
+        attn_mask,
+        i,
+        **kwargs,
+    ):
+        k_quant_scales = kwargs.get("k_quant_scales", None)
+        v_quant_scales = kwargs.get("v_quant_scales", None)
+        k_dequant_scales = kwargs.get("k_dequant_scales", None)
+        v_dequant_scales = kwargs.get("v_dequant_scales", None)
+        cache_k_zps = kwargs.get("cache_k_zp", None)
+        cache_v_zps = kwargs.get("cache_v_zp", None)
+
+        cache_quant_type_str = "none"
+        if self.config.cachekv_int8_type == "static":
+            k_quant_scales = self.cache_k_scales
+            v_quant_scales = self.cache_v_scales
+            k_dequant_scales = self.cache_k_out_scales
+            v_dequant_scales = self.cache_v_out_scales
+            cache_quant_type_str = "cache_int8"
+
+        if self.config.append_attn:
+            from paddlenlp_ops import append_attention
+
+            fmha_out = append_attention(
+                qkv_out,
+                caches[2 * i],
+                caches[2 * i + 1],
+                kwargs.get("seq_lens_encoder", None),
+                kwargs.get("seq_lens_decoder", None),
+                kwargs.get("seq_lens_this_time", None),
+                kwargs.get("padding_offsets", None),
+                kwargs.get("cum_offsets", None),
+                kwargs.get("block_tables", None),
+                kwargs.get("encoder_batch_ids", None),
+                kwargs.get("encoder_tile_ids_per_batch", None),
+                kwargs.get("encoder_num_blocks", None),
+                kwargs.get("kv_batch_ids", None),
+                kwargs.get("kv_tile_ids_per_batch", None),
+                kwargs.get("kv_num_blocks", None),
+                kwargs.get("decoder_batch_ids", None),
+                kwargs.get("decoder_tile_ids_per_batch", None),
+                kwargs.get("decoder_num_blocks", None),
+                kwargs.get("max_enc_len_this_time", None),
+                kwargs.get("max_dec_len_this_time", None),
+                kwargs.get("max_len_kv", None),
+                rotary_embs,
+                None,  # attn_mask
+                self.qkv_biases[i] if len(self.qkv_biases) > 0 else None,
+                self.qkv_out_scale,
+                k_quant_scales[i] if k_quant_scales is not None else None,
+                v_quant_scales[i] if v_quant_scales is not None else None,
+                k_dequant_scales[i] if k_dequant_scales is not None else None,
+                v_dequant_scales[i] if v_dequant_scales is not None else None,
+                cache_k_zps[i] if cache_k_zps is not None else None,
+                cache_v_zps[i] if cache_v_zps is not None else None,
+                self.linear_shifts[i] if len(self.linear_shifts) > 0 else None,
+                self.linear_smooths[i] if len(self.linear_smooths) > 0 else None,
+                self._fuse_kernel_compute_dtype,
+                cache_quant_type_str,
+                self.use_neox_rotary_style,
+                kwargs.get("max_input_length", -1),
+                0.0,
+                0.0,
+                0.0,  # out_linear_in_scale
+                kwargs.get("encoder_block_shape_q", 64),
+                kwargs.get("decoder_block_shape_q", 16),
+                kwargs.get("max_partition_size", 32768),
+                kwargs.get("encoder_max_partition_size", 32768),
+                self.config.speculate_config.speculate_max_draft_token_num,
+                True,  # causal
+                self.config.speculate_config.speculate_method is not None,  # speculate_decoder
+            )[0]
+        else:
+            fmha_out = paddle.incubate.nn.functional.block_multihead_attention(
+                qkv_out,
+                caches[2 * i],
+                caches[2 * i + 1],
+                kwargs.get("seq_lens_encoder", None),
+                kwargs.get("seq_lens_decoder", None),
+                kwargs.get("seq_lens_this_time", None),
+                kwargs.get("padding_offsets", None),
+                kwargs.get("cum_offsets", None),
+                kwargs.get("cu_seqlens_q", None),
+                kwargs.get("cu_seqlens_k", None),
+                kwargs.get("block_tables", None),
+                pre_caches[2 * i] if pre_caches is not None else None,  # pre_key_cache
+                pre_caches[2 * i + 1] if pre_caches is not None else None,  # pre_value_cache
+                k_quant_scales[i] if k_quant_scales is not None else None,
+                v_quant_scales[i] if v_quant_scales is not None else None,
+                k_dequant_scales[i] if k_dequant_scales is not None else None,
+                v_dequant_scales[i] if v_dequant_scales is not None else None,
+                self.qkv_out_scale,
+                self.qkv_biases[i] if len(self.qkv_biases) > 0 else None,
+                self.linear_shifts[i] if len(self.linear_shifts) > 0 else None,
+                self.linear_smooths[i] if len(self.linear_smooths) > 0 else None,
+                kwargs.get("max_enc_len_this_time", None),
+                kwargs.get("max_dec_len_this_time", None),
+                rotary_embs,
+                attn_mask,
+                kwargs.get("tgt_mask", None),
+                kwargs.get("max_input_length", -1),
+                kwargs.get("block_size", 64),
+                self.use_neox_rotary_style,
+                self.config.cachekv_int8_type == "dynamic",
+                quant_round_type=self.quant_round_type,
+                quant_max_bound=0.0,
+                quant_min_bound=0.0,
+                out_scale=0.0,
+                compute_dtype=self._fuse_kernel_compute_dtype,
+                rope_theta=self.config.rope_theta,
+            )[0]
+
+        return fmha_out
+
+    def compute_out_linear(self, fmha_out, i):
+        if self.skip_quant("out_linear_weight_scale", i):
+            if paddle.is_compiled_with_rocm():
+                out_linear_out = paddle.matmul(fmha_out, self.linear_weights[i])
+            else:
+                out_linear_out = paddle.matmul(fmha_out, self.linear_weights[i], False, True)
+        else:
+            if paddle.is_compiled_with_rocm():
+                out_linear_out = paddle.matmul(fmha_out, self.linear_weights[i])
+                out_linear_out = dequant_int8(out_linear_out, self.linear_out_scale, self._dtype)
+            else:
+                if self.use_gemm_dequant:
+                    from paddlenlp_ops import gemm_dequant
+
+                    out_linear_out = gemm_dequant(fmha_out, self.linear_weights[i], self.linear_out_scale, self._dtype)
+                else:
+                    out_linear_out = paddle.matmul(fmha_out, self.linear_weights[i], False, True)
+                    out_linear_out = dequant_int8(out_linear_out, self.linear_out_scale, self._dtype)
+        return out_linear_out
+
+    def compute_ffn_layernorm(self, out_linear_out, residual_input, i):
+        norm_out = self.norm_func(
+            out_linear_out,
+            norm_weight=self.ffn_ln_scales[i],
+            norm_bias=self.ffn_ln_biases[i],
+            epsilon=self._epsilon,
+            begin_norm_axis=1,
+            bias=self.linear_biases[i],
+            residual=residual_input,
+        )
+        tmp_out, residual_input = norm_out[0], norm_out[1]
+
+        return tmp_out, residual_input
+
+    def compute_activation(self, ffn1_out, i):
+        return fused_bias_act(
+            ffn1_out,
+            self.ffn1_biases[i],
+            act_method=self.activation,
+            compute_dtype=self._fuse_kernel_compute_dtype,
+            dequant_scales=self.ffn1_out_scale,
+            shift=self.ffn2_shifts[i] if len(self.ffn2_shifts) > 0 else None,
+            smooth=self.ffn2_smooths[i] if len(self.ffn2_smooths) > 0 else None,
+        )
+
+    def compute_ffn1(self, tmp_out, i):
+        if paddle.device.is_compiled_with_rocm():
+            return paddle.matmul(tmp_out, self.ffn1_weights[i])
+        else:
+            return paddle.matmul(tmp_out, self.ffn1_weights[i], False, True)
+
+    def compute_ffn2(self, ffn1_out, i):
+        if self.skip_quant("ffn2_weight_scale", i):
+            if paddle.device.is_compiled_with_rocm():
+                ffn2_out = paddle.matmul(ffn1_out, self.ffn2_weights[i])
+            else:
+                ffn2_out = paddle.matmul(ffn1_out, self.ffn2_weights[i], False, True)
+        else:
+            if paddle.device.is_compiled_with_rocm():
+                ffn2_out = paddle.matmul(ffn1_out, self.ffn2_weights[i])
+                ffn2_out = dequant_int8(ffn2_out, self.ffn2_out_scale, self._dtype)
+            else:
+                if self.use_gemm_dequant:
+                    from paddlenlp_ops import gemm_dequant
+
+                    ffn2_out = gemm_dequant(ffn1_out, self.ffn2_weights[i], self.ffn2_out_scale, self._dtype)
+                else:
+                    ffn2_out = paddle.matmul(ffn1_out, self.ffn2_weights[i], False, True)
+                    ffn2_out = dequant_int8(ffn2_out, self.ffn2_out_scale, self._dtype)
+        return ffn2_out
+
+    def compute_bias_residual_layernorm(self, ffn2_out, residual_input, i, num_layers):
+        if i != num_layers - 1:
+            norm_out = self.norm_func(
+                ffn2_out,
+                self.ln_scales[i + 1],
+                self.ln_biases[i + 1],
+                self._epsilon,
+                residual=residual_input,
+                begin_norm_axis=1,
+            )
+            tmp_out, residual_input = norm_out[0], norm_out[1]
+        else:
+            tmp_out = fused_layer_norm(
+                ffn2_out,
+                norm_weight=None,
+                norm_bias=None,
+                epsilon=self._epsilon,
+                begin_norm_axis=1,
+                bias=self.ffn2_biases[i],
+                residual=residual_input,
+            )[0]
+        return tmp_out, residual_input
+
+    def forward(
+        self,
+        input_ids,
+        src,
+        cum_offsets=None,
+        padding_offset=None,
+        attn_mask=None,
+        caches=None,
+        pre_caches=None,
+        pre_caches_length=0,
+        rotary_embs=None,
+        rotary_emb_dims=0,
+        seq_lens=None,
+        time_step=None,
+        **kwargs,
+    ):
+        r"""
+        Applies multi transformer layers on the input.
+
+        Parameters:
+            src (Tensor): The input of Transformer layers. It is
+                a tensor with shape `[batch_size, sequence_length, d_model]`.
+                The data type should be float16 or float32.
+            attn_mask (Tensor, optional): A tensor used in multi-head attention
+                to prevents attention to some unwanted positions, usually the
+                paddings or the subsequent positions. It is a tensor with shape
+                `[batch_size, 1, sequence_length, sequence_length]`. It can be
+                None when nothing wanted or needed to be prevented attention to.
+                Default None.
+            caches (list(Tensor)|tuple(Tensor), optional): The cache structure
+                tensors for the inference generation model. It is only used for
+                inference and should be None for training. The shape is
+                `[2, batch_size, num_head, max_seq_len, head_dim]`. Default None.
+            pre_caches (list(Tensor)|tuple(Tensor), optional): The prefix caches
+                for the generation model. The shape is `[2, bsz, num\_head, cache\_len, head\_dim]`. Default None.
+            rotary_embs (Tensor optional): The RoPE embs for the rotary computation. The shape is `[2, bsz, 1, seq\_len, head\_dim]`. Default None.
+            rotary_emb_dims (int, optional): The rotary_emb_dims of rotary computation, and it is 0 when rotary_embs is None,
+                1 when rotary_embs is not None and pos_extra_ids is None, 2 when rotary_embs and pos_extra_ids are both not None. Default 0.
+            seq_lens (Tensor optional): The sequence lengths of this batch. The shape is `[bsz]`. Default None.
+            time_step (Tensor, optional): The time step tensor for the generation
+                model. Which used in decode stage, to represent the time step,
+                that is, the real seq_len of CacheKV. The shape is `[1]`, must be
+                in CPUPlace. Default None.
+
+        Returns:
+            Tensor|tuple: If `caches` is None, return a tensor that has
+            the same shape and data type with `src`, representing the output
+            of Transformer layers. If `caches` is not None, return the
+            tuple (output, caches), which output is the output of
+            Transformer layers, caches is inplace with input `caches`.
+        """
+        self.pre_process(**kwargs)
+        kwargs["cum_offsets"] = cum_offsets
+
+        if caches is not None:
+            assert len(caches) == len(self.qkv_weights) or len(caches) == 2 * len(self.qkv_weights)
+
+        assert self.num_layers == len(self.qkv_weights)
+
+        max_enc_len_this_time, max_dec_len_this_time = self.compute_max_len(
+            kwargs.get("seq_lens_encoder", None), kwargs.get("seq_lens_decoder", None), cum_offsets
+        )
+        kwargs["max_enc_len_this_time"] = max_enc_len_this_time
+        kwargs["max_dec_len_this_time"] = max_dec_len_this_time
+
+        if self.config.append_attn:
+            kwargs["encoder_block_shape_q"] = 64
+            kwargs["decoder_block_shape_q"] = 16
+            kwargs["max_partition_size"] = 32768
+            kwargs["encoder_max_partition_size"] = 32768
+
+            from paddlenlp_ops import get_block_shape_and_split_kv_block
+
+            (
+                kwargs["encoder_batch_ids"],
+                kwargs["encoder_tile_ids_per_batch"],
+                kwargs["encoder_num_blocks"],
+                kwargs["kv_batch_ids"],
+                kwargs["kv_tile_ids_per_batch"],
+                kwargs["kv_num_blocks"],
+                kwargs["decoder_batch_ids"],
+                kwargs["decoder_tile_ids_per_batch"],
+                kwargs["decoder_num_blocks"],
+                kwargs["max_len_kv"],
+            ) = get_block_shape_and_split_kv_block(
+                kwargs.get("seq_lens_encoder", None),
+                kwargs.get("seq_lens_decoder", None),
+                max_enc_len_this_time,
+                kwargs.get("seq_lens_this_time", None),
+                kwargs.get("cum_offsets", None),
+                kwargs.get("encoder_block_shape_q", 64),
+                kwargs.get("decoder_block_shape_q", 16),
+                self.num_heads // self.kv_num_heads,
+                kwargs.get("block_size", 64),
+                self.config.speculate_config.speculate_max_draft_token_num,
+            )
+
+        residual_input = src
+        for i in range(self.num_layers):
+            ln_out = self.compute_layernorm_before_qkv(src, i)
+            # import pdb;pdb.set_trace()
+            ln_out, self.qkv_out_scale = self.quant_pretokken(ln_out, self.weight_scales["qkv_weight_scale"][i])
+            # import pdb;pdb.set_trace()
+            qkv_out = self.compute_qkv_linear(ln_out, i)
+            # import pdb;pdb.set_trace()
+            atten_out = self.compute_attn(
+                time_step,
+                qkv_out,
+                padding_offset,
+                seq_lens,
+                input_ids,
+                rotary_embs,
+                rotary_emb_dims,
+                caches,
+                pre_caches,
+                pre_caches_length,
+                attn_mask,
+                i,
+                **kwargs,
+            )
+            # import pdb;pdb.set_trace()
+            atten_out, self.linear_out_scale = self.quant_pretokken(
+                atten_out, self.weight_scales["out_linear_weight_scale"][i]
+            )
+            out_linear_out = self.compute_out_linear(atten_out, i)
+            # all_reduce
+            if self.nranks > 1:
+                dist.all_reduce(out_linear_out)
+
+            # ffn layernorm
+            tmp_out, residual_input = self.compute_ffn_layernorm(out_linear_out, residual_input, i)
+
+            tmp_out, self.ffn1_out_scale = self.quant_pretokken(tmp_out, self.weight_scales["ffn1_weight_scale"][i])
+
+            if self.config.moe_config.use_moe(i):
+                # fused moe
+                ffn2_out = self.compute_fused_moe(tmp_out, i)
+
+                # shared_expert
+                if self.config.moe_config.use_shared_expert(i):
+                    shared_expert_out = self.compute_shared_expert(tmp_out, i)
+                    ffn2_out = ffn2_out + shared_expert_out
+            else:
+                # ffn1 matmul
+                ffn1_out = self.compute_ffn1(tmp_out, i)
+                ffn1_out = self.compute_activation(ffn1_out, i)
+
+                ffn1_out, self.ffn2_out_scale = self.quant_pretokken(
+                    ffn1_out, self.weight_scales["ffn2_weight_scale"][i]
+                )
+                # ffn2 matmul
+                ffn2_out = self.compute_ffn2(ffn1_out, i)
+
+            # all_reduce
+            if self.nranks > 1:
+                dist.all_reduce(ffn2_out)
+
+            # norm + residual_add_bias
+            tmp_out, residual_input = self.compute_bias_residual_layernorm(
+                ffn2_out, residual_input, i, self.num_layers
+            )
+            src = tmp_out
+
+        kwargs["time_step"] = time_step
+        kwargs["multi_block_output"] = tmp_out
+        kwargs["seq_lens"] = seq_lens
+        kwargs["input_ids"] = input_ids
+
+        out = self.post_process(**kwargs)
+        import pdb
+
+        pdb.set_trace()
+        return out, caches

@@ -153,6 +153,8 @@ class PredictorArgument:
         default=2, metadata={"help": "the max length of verify window for speculate method."}
     )
     speculate_max_candidate_len: int = field(default=5, metadata={"help": "the max length of candidate tokens."})
+    dynamic_quant: bool = field(default=False, metadata={"help": "whether use dynamic quantization"})
+    vllm_compatible: bool = field(default=False, metadata={"help": "whether compatible with VLLM style."})
 
     def __post_init__(self):
         if self.speculate_method is not None:
@@ -188,7 +190,13 @@ class BasePredictor:
         self.model_config = AutoConfig.from_pretrained(config.model_name_or_path)
         self.config: PredictorArgument = config
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path, padding_side="left")
+            use_hf_tokenizer = int(os.environ.get("USE_HF_TOKENIZER", 0))
+            if use_hf_tokenizer == 1:
+                from transformers import AutoTokenizer as HF_AutoTokenizer
+
+                tokenizer = HF_AutoTokenizer.from_pretrained(config.model_name_or_path, padding_side="left")
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path, padding_side="left")
 
         self.tokenizer = tokenizer
 
@@ -212,20 +220,30 @@ class BasePredictor:
             source = [source] if isinstance(source, str) else source
             source = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in source]
 
-        tokenized_source = self.tokenizer(
-            source,
-            max_length=self.config.src_length,
-            truncation=True,
-            return_position_ids=True if not isinstance(self.tokenizer, ChatGLMTokenizer) else False,
-            truncation_side="left",
-            return_tensors=self.return_tensors,
-            padding=True,
-            # when use chat_template, it should not add special tokens
-            # chatglm2 prefix-tokens can not be tokenized into ids
-            add_special_tokens=self.tokenizer.chat_template is None
-            or isinstance(self.tokenizer, (ChatGLMv2Tokenizer, ChatGLMTokenizer)),
-        )
-        return tokenized_source
+        use_hf_tokenizer = int(os.environ.get("USE_HF_TOKENIZER", 0))
+        if use_hf_tokenizer == 1:
+            tokens = self.tokenizer(
+                source,
+                return_tensors="np",
+                padding=True,
+                truncation=True,
+            )
+            return paddle.to_tensor(tokens["input_ids"][0])
+        else:
+            tokenized_source = self.tokenizer(
+                source,
+                max_length=self.config.src_length,
+                truncation=True,
+                return_position_ids=True if not isinstance(self.tokenizer, ChatGLMTokenizer) else False,
+                truncation_side="left",
+                return_tensors=self.return_tensors,
+                padding=True,
+                # when use chat_template, it should not add special tokens
+                # chatglm2 prefix-tokens can not be tokenized into ids
+                add_special_tokens=self.tokenizer.chat_template is None
+                or isinstance(self.tokenizer, (ChatGLMv2Tokenizer, ChatGLMTokenizer)),
+            )
+            return tokenized_source
 
     @abstractmethod
     def _infer(self, inputs):
@@ -813,6 +831,11 @@ class BlockInferencePredictorMixin(BasePredictor):
         )
         self.model_inputs = {}
 
+        if config.vllm_compatible:
+            self.model_inputs["first_token_ids"] = paddle.full(
+                shape=[config.batch_size, 1], fill_value=-1, dtype="int64"
+            )
+
         if config.export_precache:
             self.model_inputs["src_mask"] = (self.pre_cache_mask - 1) * 1e4
 
@@ -958,6 +981,12 @@ class BlockInferencePredictorMixin(BasePredictor):
             shape=[self.config.batch_size, self.config.max_length], fill_value=-1, dtype="int64"
         )
         self.model_inputs["next_tokens"] = paddle.full(shape=[self.config.batch_size, 1], fill_value=-1, dtype="int64")
+
+        if self.config.vllm_compatible:
+            self.model_inputs["first_token_ids"] = self.model_inputs["input_ids"][:, 0]
+            self.model_inputs["ori_seq_lens_encoder"] = paddle.to_tensor(
+                np.array(seq_lens).astype("int32").reshape(-1, 1)
+            )
 
         # speculative decoding related parameters
         if self.config.speculate_method is not None:
@@ -1296,7 +1325,13 @@ def create_predictor(
     predictor_args: PredictorArgument,
     model_args: ModelArgument,
 ):
-    tokenizer = AutoTokenizer.from_pretrained(predictor_args.model_name_or_path)
+    use_hf_tokenizer = int(os.environ.get("USE_HF_TOKENIZER", 0))
+    if use_hf_tokenizer == 1:
+        from transformers import AutoTokenizer as HF_AutoTokenizer
+
+        tokenizer = HF_AutoTokenizer.from_pretrained(predictor_args.model_name_or_path, use_fast=False)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(predictor_args.model_name_or_path)
     # init chat_template for tokenizer
     llm_utils.init_chat_template(tokenizer, predictor_args.model_name_or_path, predictor_args.chat_template)
 

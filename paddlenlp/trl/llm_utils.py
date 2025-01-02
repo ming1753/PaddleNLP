@@ -597,7 +597,13 @@ def get_model_max_position_embeddings(config: PretrainedConfig) -> Optional[int]
 
 
 def read_res(model_name_or_path: str, tensor_queue: mp.Queue, result_queue: mp.Queue, done_event: mp.Event):
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    use_hf_tokenizer = int(os.environ.get("USE_HF_TOKENIZER", 0))
+    if use_hf_tokenizer == 1:
+        from transformers import AutoTokenizer as HF_AutoTokenizer
+
+        tokenizer = HF_AutoTokenizer.from_pretrained(model_name_or_path, use_fast=False)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
     paddle.device.set_device("cpu")
     paddle.disable_static()

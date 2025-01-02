@@ -33,6 +33,7 @@ from paddlenlp.experimental.transformers.fused_transformer_layers import (
     AvxConfig,
     FusedBlockMultiTransformer,
     FusedBlockMultiTransformerA8W8,
+    FusedBlockMultiTransformerA8W8DynamicQuant,
     FusedBlockMultiTransformerFP8,
     FusedBlockMultiTransformerWeightOnly,
     FusedMultiTransformerA8W8,
@@ -398,6 +399,8 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         self.max_position_embeddings = config.max_position_embeddings
         self.quant_type = config.get("quant_type", "")
 
+        self.dynamic_quant = config.dynamic_quant
+
         self.rope_theta = config.rope_theta
         self.use_neox = True
 
@@ -520,18 +523,19 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         ]
 
         if "a8w8" in self.quant_type:
-            qkv_out_scale_attrs = [
-                paddle.ParamAttr(name="fusellama.{}.qkv_out_scale".format(i)) for i in range(self.num_layers)
-            ]
-            linear_out_scale_attrs = [
-                paddle.ParamAttr(name="fusellama.{}.linear_out_scale".format(i)) for i in range(self.num_layers)
-            ]
-            ffn1_out_scale_attrs = [
-                paddle.ParamAttr(name="fusellama.{}.ffn1_out_scale".format(i)) for i in range(self.num_layers)
-            ]
-            ffn2_out_scale_attrs = [
-                paddle.ParamAttr(name="fusellama.{}.ffn2_out_scale".format(i)) for i in range(self.num_layers)
-            ]
+            if not self.dynamic_quant:
+                qkv_out_scale_attrs = [
+                    paddle.ParamAttr(name="fusellama.{}.qkv_out_scale".format(i)) for i in range(self.num_layers)
+                ]
+                linear_out_scale_attrs = [
+                    paddle.ParamAttr(name="fusellama.{}.linear_out_scale".format(i)) for i in range(self.num_layers)
+                ]
+                ffn1_out_scale_attrs = [
+                    paddle.ParamAttr(name="fusellama.{}.ffn1_out_scale".format(i)) for i in range(self.num_layers)
+                ]
+                ffn2_out_scale_attrs = [
+                    paddle.ParamAttr(name="fusellama.{}.ffn2_out_scale".format(i)) for i in range(self.num_layers)
+                ]
 
             if self.shift_smooth_all_linears:
                 linear_shift_attrs = [
@@ -674,7 +678,10 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         if self.use_weight_only:
             self.transformer_block = FusedMultiTransformerWeightOnly(transformer_config)
         elif "a8w8" in self.quant_type:
-            self.transformer_block = FusedMultiTransformerA8W8(transformer_config)
+            if self.dynamic_quant:
+                raise ValueError("Dynamic quantization only support block_atten/append_atten.")
+            else:
+                self.transformer_block = FusedMultiTransformerA8W8(transformer_config)
         else:
             self.transformer_block = FusedMultiTransformerBase(transformer_config)
 
@@ -858,18 +865,11 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 weight_scale_map_dict = scale_map_dict["weight_scale"]
                 cache_scale_map_dict = scale_map_dict["cachekv_scale"]
                 if not self.use_fake_parameter:
-                    act_scale_json_path = resolve_file_path(self.quant_model_path, "act_scales.json")
                     weight_scale_json_path = resolve_file_path(self.quant_model_path, "weight_scales.json")
                     if self.config.tensor_parallel_degree > 1 and not self.config.single_card_ptq:
-                        act_scale_json_path = resolve_file_path(
-                            self.quant_model_path, f"act_scales_{self.config.tensor_parallel_rank}.json"
-                        )
                         weight_scale_json_path = resolve_file_path(
                             self.quant_model_path, f"weight_scales_{self.config.tensor_parallel_rank}.json"
                         )
-                    act_scale_loader = ActScalesLoader(
-                        act_scale_json_path, act_scale_map_dict, num_of_layers=self.config.num_hidden_layers
-                    )
                     weight_scales_loader = WeightScalesLoader(
                         weight_scale_json_path,
                         weight_scale_map_dict,
@@ -877,8 +877,20 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                         concat_qkv=True,
                         concat_ffn1=True,
                     )
+                    if not self.dynamic_quant:
+                        act_scale_json_path = resolve_file_path(self.quant_model_path, "act_scales.json")
+                        if self.config.tensor_parallel_degree > 1 and not self.config.single_card_ptq:
+                            act_scale_json_path = resolve_file_path(
+                                self.quant_model_path, f"act_scales_{self.config.tensor_parallel_rank}.json"
+                            )
+                        act_scale_loader = ActScalesLoader(
+                            act_scale_json_path, act_scale_map_dict, num_of_layers=self.config.num_hidden_layers
+                        )
                 else:
-                    act_scale_loader = EmptyActScale(act_scale_map_dict, num_of_layers=self.config.num_hidden_layers)
+                    if not self.dynamic_quant:
+                        act_scale_loader = EmptyActScale(
+                            act_scale_map_dict, num_of_layers=self.config.num_hidden_layers
+                        )
                     weight_scales_loader = EmptyWeightScale(
                         weight_scale_map_dict,
                         num_of_layers=self.config.num_hidden_layers,
@@ -891,58 +903,66 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                         concat_ffn1=True,
                     )
                 self.transformer_block.weight_scales = weight_scales_loader.scale
-                self.transformer_block.act_scales = act_scale_loader.scale
+                if not self.dynamic_quant:
+                    self.transformer_block.act_scales = act_scale_loader.scale
 
-            for k, v in weight_scales_loader.scale.items():
-                if "qkv_" in k:
-                    for i_layer, weight_scale in enumerate(v):
-                        if not np.all(weight_scale == -1):
-                            tmp = paddle.to_tensor(
-                                weight_scale
-                                / (
-                                    127.0 * 127.0 * act_scale_loader.scale["qkv_in_scale"][i_layer]
-                                )  # [3 * num_head * dim_head]
-                            ).reshape([-1])
-                            if self.config.tensor_parallel_degree > 1 and self.config.single_card_ptq:
-                                tmp = (
-                                    tmp.reshape([3, self.num_attention_heads, self.head_size])
-                                    .split(self.config.tensor_parallel_degree, axis=1)[
-                                        self.config.tensor_parallel_rank
-                                    ]
-                                    .reshape([-1])
+            if not self.dynamic_quant:
+                for k, v in weight_scales_loader.scale.items():
+                    if "qkv_" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            if not np.all(weight_scale == -1):
+                                tmp = paddle.to_tensor(
+                                    weight_scale
+                                    / (
+                                        127.0 * 127.0 * act_scale_loader.scale["qkv_in_scale"][i_layer]
+                                    )  # [3 * num_head * dim_head]
+                                ).reshape([-1])
+                                if self.config.tensor_parallel_degree > 1 and self.config.single_card_ptq:
+                                    tmp = (
+                                        tmp.reshape([3, self.num_attention_heads, self.head_size])
+                                        .split(self.config.tensor_parallel_degree, axis=1)[
+                                            self.config.tensor_parallel_rank
+                                        ]
+                                        .reshape([-1])
+                                    )
+                                import pdb
+
+                                pdb.set_trace()
+                                self.transformer_block.qkv_out_scales[i_layer].set_value(tmp)
+
+                    elif "out_linear_" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            if not np.all(weight_scale == -1):
+                                tmp = paddle.to_tensor(
+                                    weight_scale
+                                    / (127.0 * 127.0 * act_scale_loader.scale["out_linear_in_scale"][i_layer])
                                 )
-                            self.transformer_block.qkv_out_scales[i_layer].set_value(tmp)
-                elif "out_linear_" in k:
-                    for i_layer, weight_scale in enumerate(v):
-                        if not np.all(weight_scale == -1):
-                            tmp = paddle.to_tensor(
-                                weight_scale / (127.0 * 127.0 * act_scale_loader.scale["out_linear_in_scale"][i_layer])
-                            )
-                            self.transformer_block.linear_out_scales[i_layer].set_value(tmp)
-                elif "ffn1_weight_scale" in k:
-                    for i_layer, weight_scale in enumerate(v):
-                        if not np.all(weight_scale == -1):
-                            tmp = paddle.to_tensor(
-                                weight_scale / (127.0 * 127.0 * act_scale_loader.scale["ffn1_in_scale"][i_layer])
-                            )
-                            if self.config.tensor_parallel_degree > 1 and self.config.single_card_ptq:
-                                tmp = paddle.split(tmp, self.config.tensor_parallel_degree * 2)
-                                tmp = paddle.concat(
-                                    [
-                                        tmp[self.config.tensor_parallel_rank],
-                                        tmp[self.config.tensor_parallel_rank + self.config.tensor_parallel_degree],
-                                    ],
-                                    axis=0,
+                                self.transformer_block.linear_out_scales[i_layer].set_value(tmp)
+                    elif "ffn1_weight_scale" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            if not np.all(weight_scale == -1):
+                                tmp = paddle.to_tensor(
+                                    weight_scale / (127.0 * 127.0 * act_scale_loader.scale["ffn1_in_scale"][i_layer])
                                 )
-                            self.transformer_block.ffn1_out_scales[i_layer].set_value(tmp)
-                elif "ffn2" in k:
-                    for i_layer, weight_scale in enumerate(v):
-                        if not np.all(weight_scale == -1):
-                            self.transformer_block.ffn2_out_scales[i_layer].set_value(
-                                paddle.to_tensor(
-                                    weight_scale / (127.0 * 127.0 * act_scale_loader.scale["ffn2_in_scale"][i_layer])
+                                if self.config.tensor_parallel_degree > 1 and self.config.single_card_ptq:
+                                    tmp = paddle.split(tmp, self.config.tensor_parallel_degree * 2)
+                                    tmp = paddle.concat(
+                                        [
+                                            tmp[self.config.tensor_parallel_rank],
+                                            tmp[self.config.tensor_parallel_rank + self.config.tensor_parallel_degree],
+                                        ],
+                                        axis=0,
+                                    )
+                                self.transformer_block.ffn1_out_scales[i_layer].set_value(tmp)
+                    elif "ffn2" in k:
+                        for i_layer, weight_scale in enumerate(v):
+                            if not np.all(weight_scale == -1):
+                                self.transformer_block.ffn2_out_scales[i_layer].set_value(
+                                    paddle.to_tensor(
+                                        weight_scale
+                                        / (127.0 * 127.0 * act_scale_loader.scale["ffn2_in_scale"][i_layer])
+                                    )
                                 )
-                            )
 
         if self.config.cachekv_int8_type == "static":
             if not self.use_fake_parameter:
@@ -1379,7 +1399,10 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
         if self.use_weight_only:
             self.transformer_block = FusedBlockMultiTransformerWeightOnly(transformer_config)
         elif self.quant_type == "a8w8" or self.quant_type == "a8w8c8":
-            self.transformer_block = FusedBlockMultiTransformerA8W8(transformer_config)
+            if self.dynamic_quant:
+                self.transformer_block = FusedBlockMultiTransformerA8W8DynamicQuant(transformer_config)
+            else:
+                self.transformer_block = FusedBlockMultiTransformerA8W8(transformer_config)
         elif "fp8" in self.quant_type:
             self.transformer_block = FusedBlockMultiTransformerFP8(transformer_config)
         else:
