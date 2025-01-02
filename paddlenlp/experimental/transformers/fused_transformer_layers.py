@@ -3539,7 +3539,5 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
         kwargs["input_ids"] = input_ids
 
         out = self.post_process(**kwargs)
-        import pdb
-
-        pdb.set_trace()
+        # import pdb;pdb.set_trace()
         return out, caches

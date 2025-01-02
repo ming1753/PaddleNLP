@@ -1171,6 +1171,8 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
             config.single_card_ptq = not predictor_args.use_fake_parameter
         config.append_attn = predictor_args.append_attn
         config.decode_strategy = predictor_args.decode_strategy
+        config.dynamic_quant = predictor_args.dynamic_quant
+        config.vllm_compatible = predictor_args.vllm_compatible
 
         if config.quantization_config.quant_type is not None:
             if predictor_args.mode == "dynamic":
