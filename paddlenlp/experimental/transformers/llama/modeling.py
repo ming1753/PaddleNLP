@@ -925,9 +925,6 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                                         ]
                                         .reshape([-1])
                                     )
-                                import pdb
-
-                                pdb.set_trace()
                                 self.transformer_block.qkv_out_scales[i_layer].set_value(tmp)
 
                     elif "out_linear_" in k:
