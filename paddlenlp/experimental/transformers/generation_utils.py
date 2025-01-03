@@ -547,6 +547,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
             input_spec.append(
                 paddle.static.InputSpec(shape=[None, 1], dtype="int32", name="ori_seq_lens_encoder")
             )  # ori_seq_lens_encoder
+        else:
+            input_spec.extend([None, None])
         if config.get("speculate_method", None) is not None:
             speculate_spec = [
                 paddle.static.InputSpec(shape=[None, None], dtype="int64", name="draft_tokens"),
@@ -594,7 +596,6 @@ class GenerationBlockInferenceModel(GenerationMixin):
     def generate(
         self,
         input_ids=None,
-        first_token_ids=None,
         temperature=None,
         top_p=None,
         eos_token_id=None,
@@ -606,7 +607,6 @@ class GenerationBlockInferenceModel(GenerationMixin):
         is_block_step=None,
         seq_lens_this_time=None,  # update
         seq_lens_encoder=None,  # update
-        ori_seq_lens_encoder=None,
         seq_lens_decoder=None,  # update
         step_idx=None,
         stop_flags=None,
@@ -625,6 +625,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
         k_dequant_scales=None,
         v_dequant_scales=None,
         tgt_mask=None,
+        first_token_ids=None,
+        ori_seq_lens_encoder=None,
         draft_tokens=None,
         accept_tokens=None,
         accept_num=None,
