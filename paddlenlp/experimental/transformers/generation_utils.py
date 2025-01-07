@@ -24,13 +24,6 @@ from paddlenlp.generation import GenerationMixin, LogitsProcessor, LogitsProcess
 __all__ = ["GenerationInferenceModel", "GenerationBlockInferenceModel", "GenerationAvxInferenceModel"]
 
 
-def TopKProcess(probs: paddle.Tensor, top_k: int, min_tokens_to_keep: int):
-    top_k = min(max(top_k, min_tokens_to_keep), probs.shape[-1])
-    topk_probs, _ = paddle.topk(probs, k=top_k)
-    probs = paddle.where(probs >= topk_probs[:, -1:], probs, paddle.full_like(probs, -float("inf")))
-    return probs
-
-
 def use_faster_top_p_sampling():
     """Get the value of the 'USE_FASTER_TOP_P_SAMPLING' environment variable."""
     return os.getenv("USE_FASTER_TOP_P_SAMPLING", "False") in ["True", "1", "true"]
@@ -280,7 +273,6 @@ class GenerationInferenceModel(GenerationMixin):
         top_p=None,
         temperature=None,
         inputs_embeds=None,
-        min_tokens_to_keep=1,
         **model_kwargs,
     ):
         step_idx_ori = paddle.full(shape=[1], dtype="int64", fill_value=1)
@@ -341,8 +333,6 @@ class GenerationInferenceModel(GenerationMixin):
             logits = logits / temperature
 
             # sample
-            if self.config.top_k is not None and self.config.top_k != 0:
-                logits = TopKProcess(logits, self.config.top_k, min_tokens_to_keep)
             probs = F.softmax(logits)
 
             # compute next_tokens
