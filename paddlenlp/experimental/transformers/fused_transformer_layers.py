@@ -3187,10 +3187,6 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
                 0.0,
                 0.0,
                 0.0,  # out_linear_in_scale
-                kwargs.get("encoder_block_shape_q", 64),
-                kwargs.get("decoder_block_shape_q", 16),
-                kwargs.get("max_partition_size", 32768),
-                kwargs.get("encoder_max_partition_size", 32768),
                 self.config.speculate_config.speculate_max_draft_token_num,
                 True,  # causal
                 self.config.speculate_config.speculate_method is not None,  # speculate_decoder
@@ -3397,10 +3393,6 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
         kwargs["max_dec_len_this_time"] = max_dec_len_this_time
 
         if self.config.append_attn:
-            kwargs["encoder_block_shape_q"] = 64
-            kwargs["decoder_block_shape_q"] = 16
-            kwargs["max_partition_size"] = 32768
-            kwargs["encoder_max_partition_size"] = 32768
 
             from paddlenlp_ops import get_block_shape_and_split_kv_block
 
@@ -3421,8 +3413,6 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
                 max_enc_len_this_time,
                 kwargs.get("seq_lens_this_time", None),
                 kwargs.get("cum_offsets", None),
-                kwargs.get("encoder_block_shape_q", 64),
-                kwargs.get("decoder_block_shape_q", 16),
                 self.num_heads // self.kv_num_heads,
                 kwargs.get("block_size", 64),
                 self.config.speculate_config.speculate_max_draft_token_num,
