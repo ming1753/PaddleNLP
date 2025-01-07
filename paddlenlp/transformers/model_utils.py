@@ -1172,7 +1172,8 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         config.append_attn = predictor_args.append_attn
         config.decode_strategy = predictor_args.decode_strategy
         config.dynamic_quant = predictor_args.dynamic_quant
-        config.vllm_compatible = predictor_args.vllm_compatible
+        config.reduce_dialogue_repetition = predictor_args.reduce_dialogue_repetition
+        config.use_stop_seqs = predictor_args.use_stop_seqs
 
         if config.quantization_config.quant_type is not None:
             if predictor_args.mode == "dynamic":

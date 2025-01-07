@@ -506,8 +506,17 @@ class GenerationBlockInferenceModel(GenerationMixin):
         else:
             tgt_mask_spec = None
 
+        if config.get("use_stop_seqs", False):
+            stop_seqs = paddle.static.InputSpec(shape=[None, None], dtype="int64", name="stop_seqs")
+            stop_seqs_len = paddle.static.InputSpec(shape=[None], dtype="int32", name="stop_seqs_len")
+        else:
+            stop_seqs = None
+            stop_seqs_len = None
+
         input_spec = [
             paddle.static.InputSpec(shape=[None, None], dtype="int64", name="input_ids"),  # input_ids
+            stop_seqs,
+            stop_seqs_len,
             paddle.static.InputSpec(shape=[None, 1], dtype="float32", name="temperature"),  # temperature
             paddle.static.InputSpec(shape=[None, 1], dtype="float32", name="top_p"),  # top_p
             paddle.static.InputSpec(shape=[None], dtype="int64", name="eos_token_id"),  # eos_token_id
@@ -540,7 +549,7 @@ class GenerationBlockInferenceModel(GenerationMixin):
             cache_v_dequant_scales,
             tgt_mask_spec,
         ]
-        if config.get("vllm_compatible", False):
+        if config.get("reduce_dialogue_repetition", False):
             input_spec.append(
                 paddle.static.InputSpec(shape=[None, 1], dtype="int64", name="first_token_ids")
             )  # first_token_ids
@@ -596,6 +605,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
     def generate(
         self,
         input_ids=None,
+        stop_seqs=None,
+        stop_seqs_len=None,
         temperature=None,
         top_p=None,
         eos_token_id=None,
@@ -666,7 +677,7 @@ class GenerationBlockInferenceModel(GenerationMixin):
         model_kwargs["accept_tokens"] = accept_tokens
         model_kwargs["accept_num"] = accept_num
         model_kwargs["actual_draft_token_num"] = actual_draft_token_num
-        if self.config.vllm_compatible:
+        if self.config.reduce_dialogue_repetition:
             model_kwargs["first_token_ids"] = first_token_ids
             model_kwargs["ori_seq_lens_encoder"] = ori_seq_lens_encoder
 
@@ -678,12 +689,14 @@ class GenerationBlockInferenceModel(GenerationMixin):
                 temperature=temperature,
                 **model_kwargs,
             )
-        elif self.config.vllm_compatible:
+        elif self.config.reduce_dialogue_repetition:
             ret = self.sample_compatible(
                 eos_token_id,
                 top_k=0,
                 top_p=top_p,
                 temperature=temperature,
+                stop_seqs=stop_seqs,
+                stop_seqs_len=stop_seqs_len,
                 **model_kwargs,
             )
         else:
@@ -692,6 +705,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
                 top_k=0,
                 top_p=top_p,
                 temperature=temperature,
+                stop_seqs=stop_seqs,
+                stop_seqs_len=stop_seqs_len,
                 **model_kwargs,
             )
         return ret
@@ -705,6 +720,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
         frequency_score,
         presence_score,
         temperature=None,
+        stop_seqs=None,
+        stop_seqs_len=None,
         min_tokens_to_keep=1,
         **model_kwargs
     ):
@@ -945,6 +962,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
         frequency_score,
         presence_score,
         temperature=None,
+        stop_seqs=None,
+        stop_seqs_len=None,
         min_tokens_to_keep=1,
         **model_kwargs
     ):
@@ -966,9 +985,9 @@ class GenerationBlockInferenceModel(GenerationMixin):
             logits = paddle.cast(outputs, paddle.float32)
 
             # pre-process distribution
-            from paddlenlp_ops import get_token_penalty_multi_scores_vllm
+            from paddlenlp_ops import get_token_penalty_multi_scores_dialog_repet
 
-            logits = get_token_penalty_multi_scores_vllm(
+            logits = get_token_penalty_multi_scores_dialog_repet(
                 model_kwargs["input_ids"],
                 model_kwargs["first_token_ids"],
                 model_kwargs["pre_ids"],
@@ -985,9 +1004,6 @@ class GenerationBlockInferenceModel(GenerationMixin):
             )
 
             # sample
-            # self.config.top_k = 20
-            # # if self.config.top_k is not None and self.config.top_k != 0:
-            # logits = TopKProcess(logits, self.config.top_k, min_tokens_to_keep)
             probs = F.softmax(logits)
 
             # compute next_tokens
@@ -998,9 +1014,9 @@ class GenerationBlockInferenceModel(GenerationMixin):
             else:
                 _, next_tokens = paddle.tensor.top_p_sampling(probs, top_p)
 
-            from paddlenlp_ops import set_value_by_flags_and_idx_vllm
+            from paddlenlp_ops import set_value_by_flags_and_idx_dialog_repet
 
-            set_value_by_flags_and_idx_vllm(
+            set_value_by_flags_and_idx_dialog_repet(
                 model_kwargs["pre_ids"],
                 next_tokens,
                 model_kwargs["seq_lens_this_time"],
@@ -1017,11 +1033,30 @@ class GenerationBlockInferenceModel(GenerationMixin):
             paddle.assign(step_idx, model_kwargs["step_idx"])
             length_cond = paddle.greater_equal(step_idx, model_kwargs["max_dec_len"])
             stop_flags = paddle.logical_or(model_kwargs["stop_flags"], length_cond)
-            from paddlenlp_ops import set_stop_value_multi_ends_v2
+            from paddlenlp_ops import (
+                set_stop_value_multi_ends_v2,
+                set_stop_value_multi_seqs,
+            )
 
-            set_stop_value_multi_ends_v2(
-                next_tokens, stop_flags, model_kwargs["seq_lens_this_time"], eos_token_id, model_kwargs["next_tokens"]
-            )  # multi ends
+            if stop_seqs is not None and stop_seqs_len is not None:
+                set_stop_value_multi_seqs(
+                    next_tokens,
+                    model_kwargs["pre_ids"],
+                    step_idx,
+                    stop_flags,
+                    model_kwargs["seq_lens_this_time"],
+                    stop_seqs,
+                    stop_seqs_len,
+                    eos_token_id,
+                )
+            else:
+                set_stop_value_multi_ends_v2(
+                    next_tokens,
+                    stop_flags,
+                    model_kwargs["seq_lens_this_time"],
+                    eos_token_id,
+                    model_kwargs["next_tokens"],
+                )  # multi ends
             paddle.assign(stop_flags, model_kwargs["stop_flags"])
             # update inputs
             from paddlenlp_ops import update_inputs

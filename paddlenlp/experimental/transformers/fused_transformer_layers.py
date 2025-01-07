@@ -3092,17 +3092,6 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
                 return self._dtype
         return "int8"
 
-    # def quant_pretokken(self, inputs, weight_scale):
-    #     scales = paddle.max(paddle.abs(inputs), axis=-1, keepdim=True)
-    #     scales = paddle.where(scales == paddle.to_tensor(0, dtype="bfloat16"),
-    #                                 paddle.to_tensor(1e-8, dtype="bfloat16"), scales)
-    #     quant_tensor = paddle.clip(paddle.round(inputs / scales * 127.0), -127.0, 127.0)
-    #     quant_tensor = paddle.cast(quant_tensor, "int8")
-    #     # dequant_tensor = quant_tensor * scales / 127.0
-    #     out_scale = (weight_scale * scales) / (127.0 * 127.0)
-    #     out_scale = paddle.cast(out_scale, "float32")
-    #     return quant_tensor, out_scale
-
     def quant_pertensor(self, inputs, weight_scale):
         scales = paddle.max(paddle.abs(inputs))
         scales = paddle.where(
@@ -3110,7 +3099,6 @@ class FusedBlockMultiTransformerA8W8DynamicQuant(FusedBlockMultiTransformer):
         )
         quant_tensor = paddle.clip(paddle.round(inputs / scales * 127.0), -127.0, 127.0)
         quant_tensor = paddle.cast(quant_tensor, "int8")
-        # dequant_tensor = quant_tensor * scales / 127.0
         out_scale = (weight_scale * scales) / (127.0 * 127.0)
         out_scale = paddle.cast(out_scale, "float32")
         return quant_tensor, out_scale

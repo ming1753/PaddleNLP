@@ -68,7 +68,8 @@ def main():
             "export_precache": predictor_args.export_precache,
             "cachekv_int8_type": predictor_args.cachekv_int8_type,
             "speculate_method": predictor_args.speculate_method,
-            "vllm_compatible": predictor_args.vllm_compatible,
+            "reduce_dialogue_repetition": predictor_args.reduce_dialogue_repetition,
+            "use_stop_seqs": predictor_args.use_stop_seqs,
         },
     )
     add_inference_args_to_config(predictor.model.config, predictor_args)

@@ -16,7 +16,7 @@
 
 
 template<typename T>
-__global__ inline void min_length_logits_process_v2(T* logits,
+__global__ inline void min_length_logits_process_dialog_repet(T* logits,
                                                  const int64_t *cur_len,
                                                  const int64_t *min_len,
                                                  const int64_t *eos_token_id,
@@ -36,7 +36,7 @@ __global__ inline void min_length_logits_process_v2(T* logits,
 }
 
 template<>
-__global__ inline void min_length_logits_process_v2<half>(half* logits,
+__global__ inline void min_length_logits_process_dialog_repet<half>(half* logits,
                                                        const int64_t *cur_len,
                                                        const int64_t *min_len,
                                                        const int64_t *eos_token_id,
@@ -55,7 +55,7 @@ __global__ inline void min_length_logits_process_v2<half>(half* logits,
     }
 }
 
-__global__ void update_repeat_times_v2(const int64_t *pre_ids,
+__global__ void update_repeat_times_dialog_repet(const int64_t *pre_ids,
                                     const int64_t *input_ids,
                                     const int64_t *first_token_ids,
                                     const int64_t *cur_len,
@@ -96,7 +96,7 @@ __global__ void update_repeat_times_v2(const int64_t *pre_ids,
 }
 
 template<typename T>
-__global__ void update_value_by_repeat_times_v2(const int *repeat_times,
+__global__ void update_value_by_repeat_times_dialog_repet(const int *repeat_times,
                                              const T *penalty_scores,
                                              const T *frequency_score,
                                              const T *presence_score,
@@ -139,7 +139,7 @@ __global__ void ban_bad_words(T *logits,
 }
 
 template <paddle::DataType D>
-void token_penalty_multi_scores_kernel_v2(const paddle::Tensor& input_ids,
+void token_penalty_multi_scores_kernel_dialog_repet(const paddle::Tensor& input_ids,
                                        const paddle::Tensor& first_token_ids,
                                        const paddle::Tensor& pre_ids,
                                        const paddle::Tensor& logits,
@@ -168,7 +168,7 @@ void token_penalty_multi_scores_kernel_v2(const paddle::Tensor& input_ids,
     int64_t end_length = eos_token_id.shape()[0];
 
     int block_size = (bs + 32 - 1) / 32 * 32;
-    min_length_logits_process_v2<<<1, block_size, 0, cu_stream>>>(
+    min_length_logits_process_dialog_repet<<<1, block_size, 0, cu_stream>>>(
         reinterpret_cast<DataType_*>(const_cast<data_t*>(logits.data<data_t>())),
         cur_len.data<int64_t>(),
         min_len.data<int64_t>(),
@@ -176,7 +176,7 @@ void token_penalty_multi_scores_kernel_v2(const paddle::Tensor& input_ids,
         bs, length, end_length);
 
     block_size = 1024;
-    update_repeat_times_v2<<<bs, block_size, 0, cu_stream>>>(
+    update_repeat_times_dialog_repet<<<bs, block_size, 0, cu_stream>>>(
         pre_ids.data<int64_t>(), 
         input_ids.data<int64_t>(),
         first_token_ids.data<int64_t>(), 
@@ -190,7 +190,7 @@ void token_penalty_multi_scores_kernel_v2(const paddle::Tensor& input_ids,
     
     block_size = (length + 32 - 1) / 32 * 32;
     block_size = min(block_size, 512);
-    update_value_by_repeat_times_v2<DataType_><<<bs, block_size, 0, cu_stream>>>(
+    update_value_by_repeat_times_dialog_repet<DataType_><<<bs, block_size, 0, cu_stream>>>(
         repeat_times.data<int>(),
         reinterpret_cast<DataType_*>(const_cast<data_t*>(penalty_scores.data<data_t>())),
         reinterpret_cast<DataType_*>(const_cast<data_t*>(frequency_score.data<data_t>())),
@@ -211,7 +211,7 @@ void token_penalty_multi_scores_kernel_v2(const paddle::Tensor& input_ids,
     );
 }
 
-void TokenPenaltyMultiScoresVLLM(const paddle::Tensor& input_ids,
+void TokenPenaltyMultiScoresDialogRepet(const paddle::Tensor& input_ids,
                              const paddle::Tensor& first_token_ids,
                              const paddle::Tensor& pre_ids,
                              const paddle::Tensor& logits,
@@ -227,7 +227,7 @@ void TokenPenaltyMultiScoresVLLM(const paddle::Tensor& input_ids,
 
     switch (logits.type()) {
         case paddle::DataType::BFLOAT16: {
-            return token_penalty_multi_scores_kernel_v2<paddle::DataType::BFLOAT16>(
+            return token_penalty_multi_scores_kernel_dialog_repet<paddle::DataType::BFLOAT16>(
                 input_ids,
                 first_token_ids,
                 pre_ids,
@@ -244,7 +244,7 @@ void TokenPenaltyMultiScoresVLLM(const paddle::Tensor& input_ids,
             );
         }
         case paddle::DataType::FLOAT16: {
-            return token_penalty_multi_scores_kernel_v2<paddle::DataType::FLOAT16>(
+            return token_penalty_multi_scores_kernel_dialog_repet<paddle::DataType::FLOAT16>(
                 input_ids,
                 first_token_ids,
                 pre_ids,
@@ -261,7 +261,7 @@ void TokenPenaltyMultiScoresVLLM(const paddle::Tensor& input_ids,
             );
         }
         case paddle::DataType::FLOAT32: {
-            return token_penalty_multi_scores_kernel_v2<paddle::DataType::FLOAT32>(
+            return token_penalty_multi_scores_kernel_dialog_repet<paddle::DataType::FLOAT32>(
                 input_ids,
                 first_token_ids,
                 pre_ids,
@@ -286,7 +286,7 @@ void TokenPenaltyMultiScoresVLLM(const paddle::Tensor& input_ids,
     }
 }
 
-PD_BUILD_OP(get_token_penalty_multi_scores_vllm)
+PD_BUILD_OP(get_token_penalty_multi_scores_dialog_repet)
     .Inputs({"input_ids",
              "first_token_ids",
              "pre_ids",
@@ -302,4 +302,4 @@ PD_BUILD_OP(get_token_penalty_multi_scores_vllm)
              "eos_token_id"})
     .Outputs({"logits_out"})
     .SetInplaceMap({{"logits", "logits_out"}})
-    .SetKernelFn(PD_KERNEL(TokenPenaltyMultiScoresVLLM));
+    .SetKernelFn(PD_KERNEL(TokenPenaltyMultiScoresDialogRepet));

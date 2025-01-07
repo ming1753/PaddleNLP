@@ -154,7 +154,8 @@ class PredictorArgument:
     )
     speculate_max_candidate_len: int = field(default=5, metadata={"help": "the max length of candidate tokens."})
     dynamic_quant: bool = field(default=False, metadata={"help": "whether use dynamic quantization"})
-    vllm_compatible: bool = field(default=False, metadata={"help": "whether compatible with VLLM style."})
+    reduce_dialogue_repetition: bool = field(default=False, metadata={"help": "whether compatible with VLLM style."})
+    use_stop_seqs: bool = field(default=False, metadata={"help": "whether use stop_sequences"})
 
     def __post_init__(self):
         if self.speculate_method is not None:
@@ -228,7 +229,10 @@ class BasePredictor:
                 padding=True,
                 truncation=True,
             )
-            return paddle.to_tensor(tokens["input_ids"][0])
+            for key, values in tokens.items():
+                if isinstance(values, np.ndarray):
+                    tokens[key] = paddle.to_tensor(values)
+            return tokens
         else:
             tokenized_source = self.tokenizer(
                 source,
@@ -831,7 +835,7 @@ class BlockInferencePredictorMixin(BasePredictor):
         )
         self.model_inputs = {}
 
-        if config.vllm_compatible:
+        if config.reduce_dialogue_repetition:
             self.model_inputs["first_token_ids"] = paddle.full(
                 shape=[config.batch_size, 1], fill_value=-1, dtype="int64"
             )
@@ -982,11 +986,15 @@ class BlockInferencePredictorMixin(BasePredictor):
         )
         self.model_inputs["next_tokens"] = paddle.full(shape=[self.config.batch_size, 1], fill_value=-1, dtype="int64")
 
-        if self.config.vllm_compatible:
+        if self.config.reduce_dialogue_repetition:
             self.model_inputs["first_token_ids"] = self.model_inputs["input_ids"][:, 0]
             self.model_inputs["ori_seq_lens_encoder"] = paddle.to_tensor(
                 np.array(seq_lens).astype("int32").reshape(-1, 1)
             )
+
+        if self.config.use_stop_seqs:
+            self.model_inputs["stop_seqs"] = paddle.full(shape=[5, 8], fill_value=-1, dtype="int64")
+            self.model_inputs["stop_seqs_len"] = paddle.full(shape=[5], fill_value=0, dtype="int32")
 
         # speculative decoding related parameters
         if self.config.speculate_method is not None:

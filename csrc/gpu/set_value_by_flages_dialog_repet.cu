@@ -14,7 +14,7 @@
 
 #include "paddle/extension.h"
 
-__global__ void set_value_by_flag_and_id_v2(const bool *stop_flags, 
+__global__ void set_value_by_flag_and_id_dialog_repet(const bool *stop_flags, 
                                             int64_t *pre_ids_all, 
                                             const int64_t *next_tokens, 
                                             const int *seq_lens_encoder, 
@@ -35,7 +35,7 @@ __global__ void set_value_by_flag_and_id_v2(const bool *stop_flags,
     }
 }
 
-void SetValueByFlagsAndIdxVLLM(const paddle::Tensor& pre_ids_all, 
+void SetValueByFlagsAndIdxDialogRepet(const paddle::Tensor& pre_ids_all, 
                              const paddle::Tensor& next_tokens,
                              const paddle::Tensor& seq_lens_this_time,
                              const paddle::Tensor& seq_lens_encoder,
@@ -48,7 +48,7 @@ void SetValueByFlagsAndIdxVLLM(const paddle::Tensor& pre_ids_all,
     int bs = seq_lens_this_time.shape()[0];
     int length = pre_ids_all_shape[1];
     int block_size = (bs + 32 - 1) / 32 * 32;
-    set_value_by_flag_and_id_v2<<<1, block_size, 0, cu_stream>>>(stop_flags.data<bool>(), 
+    set_value_by_flag_and_id_dialog_repet<<<1, block_size, 0, cu_stream>>>(stop_flags.data<bool>(), 
                                                                  const_cast<int64_t*>(pre_ids_all.data<int64_t>()), 
                                                                  next_tokens.data<int64_t>(), 
                                                                  seq_lens_encoder.data<int>(),
@@ -58,8 +58,8 @@ void SetValueByFlagsAndIdxVLLM(const paddle::Tensor& pre_ids_all,
                                                                  length);
 }
 
-PD_BUILD_OP(set_value_by_flags_and_idx_vllm)
+PD_BUILD_OP(set_value_by_flags_and_idx_dialog_repet)
     .Inputs({"pre_ids_all", "next_tokens", "seq_lens_this_time", "seq_lens_encoder", "seq_lens_decoder", "step_idx", "stop_flags"})
     .Outputs({"pre_ids_all_out"})
     .SetInplaceMap({{"pre_ids_all", "pre_ids_all_out"}})
-    .SetKernelFn(PD_KERNEL(SetValueByFlagsAndIdxVLLM));
+    .SetKernelFn(PD_KERNEL(SetValueByFlagsAndIdxDialogRepet));
