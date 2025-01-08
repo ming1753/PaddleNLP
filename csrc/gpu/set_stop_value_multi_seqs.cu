@@ -1,4 +1,4 @@
-// Copyright (c) 2024 PaddlePaddle Authors. All Rights Reserved.
+// Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,7 +45,13 @@ __global__ void set_value_by_stop_seqs(
             return;
         }
         bool is_end = true;
-        int count = 2;
+        int count = 1;
+        if (topk_ids[bid] == end_ids[0]) {
+            if (tid == 0) {
+                stop_flags[bid] = true;
+            }
+            return;
+        }
         for (int i = stop_seq_len - 1; i >= 0; --i) {
             if ((step_idx_now - count) < 0 || pre_ids_now[step_idx_now - count++] != stop_seq_now[i]) {
                 is_end = false;
@@ -53,15 +59,11 @@ __global__ void set_value_by_stop_seqs(
             }
         }
         if (is_end) {
-            if (step_idx_now >= 2 && pre_ids_now[step_idx_now - 2] == end_ids[0]) {
-                topk_ids[bid] = -1;
-                stop_flags[bid] = true;
-            } else {
-                topk_ids[bid] = end_ids[0];
-                stop_flags[bid] = true;
-            }
+            topk_ids[bid] = end_ids[0];
+            stop_flags[bid] = true;
         }
     }
+
 }
 
 void GetStopFlagsMultiSeqs(const paddle::Tensor& topk_ids, 
