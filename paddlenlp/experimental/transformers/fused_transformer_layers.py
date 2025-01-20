@@ -73,6 +73,8 @@ if paddle.is_compiled_with_cuda():
             rebuild_padding,
             transpose_remove_padding,
             write_cache_kv,
+            open_shm_and_get_meta_signal,
+            init_signal_layerwise
         )
     except:
         pass
@@ -412,6 +414,9 @@ class FusedMultiTransformerBase(Layer):
         assert self.num_layers > 0
         if config.qkv_weight_attrs is not None and isinstance(config.qkv_weight_attrs, (list, tuple)):
             assert self.num_layers == len(config.qkv_weight_attrs)
+
+        self.rank = config.rank_id
+        self.use_pd_disaggregation = int(os.getenv("FLAGS_use_pd_disaggregation", 0))
 
         if self.config.mla_config.use_mla():
             mscale = self.config.mla_config.mscale
@@ -1118,6 +1123,7 @@ class FusedMultiTransformerBase(Layer):
         pre_caches,
         pre_caches_length,
         attn_mask,
+        kv_signal_data,
         i,
         **kwargs,
     ):
@@ -1399,6 +1405,9 @@ class FusedMultiTransformerBase(Layer):
         kwargs["max_enc_len_this_time"] = max_enc_len_this_time
         kwargs["max_dec_len_this_time"] = max_dec_len_this_time
 
+        if self.use_pd_disaggregation:
+            kv_signal_metadata = open_shm_and_get_meta_signal(self.rank)
+
         if self.config.append_attn:
 
             from paddlenlp_ops import get_block_shape_and_split_kv_block
@@ -1428,6 +1437,10 @@ class FusedMultiTransformerBase(Layer):
 
         residual_input = src
         for i in range(self.num_layers):
+            if self.use_pd_disaggregation:
+                kv_signal_data = init_signal_layerwise(kv_signal_metadata, i)
+            else:
+                kv_signal_data = None
             qkv_out, residual_input = self.compute_qkv(src, residual_input, i)
             out_linear_out = self.compute_attn(
                 time_step,
@@ -1441,6 +1454,7 @@ class FusedMultiTransformerBase(Layer):
                 pre_caches,
                 pre_caches_length,
                 attn_mask,
+                kv_signal_data,
                 i,
                 **kwargs,
             )
@@ -2699,6 +2713,7 @@ class FusedBlockMultiTransformer(FusedMultiTransformerBase):
         pre_caches,
         pre_caches_length,
         attn_mask,
+        kv_signal_data,
         i,
         **kwargs,
     ):
@@ -2739,6 +2754,7 @@ class FusedBlockMultiTransformer(FusedMultiTransformerBase):
                 None,  # cache_v_zp
                 None,  # out_shifts
                 None,  # out_smooths
+                kv_signal_data,
                 self._fuse_kernel_compute_dtype,
                 "none",  # cache_quant_type
                 self.use_neox_rotary_style,
@@ -2884,6 +2900,7 @@ class FusedBlockMultiTransformerA8W8(FusedBlockMultiTransformer, FusedMultiTrans
         pre_caches,
         pre_caches_length,
         attn_mask,
+        kv_signal_data,
         i,
         **kwargs,
     ):
@@ -2939,6 +2956,7 @@ class FusedBlockMultiTransformerA8W8(FusedBlockMultiTransformer, FusedMultiTrans
                 cache_v_zps[i] if cache_v_zps is not None else None,
                 self.linear_shifts[i] if len(self.linear_shifts) > 0 else None,
                 self.linear_smooths[i] if len(self.linear_smooths) > 0 else None,
+                kv_signal_data,
                 self._fuse_kernel_compute_dtype,
                 cache_quant_type_str,
                 self.use_neox_rotary_style,
@@ -3223,6 +3241,7 @@ class FusedBlockMultiTransformerFP8(FusedBlockMultiTransformer):
         pre_caches,
         pre_caches_length,
         attn_mask,
+        kv_signal_data,
         i,
         **kwargs,
     ):
@@ -3299,6 +3318,7 @@ class FusedBlockMultiTransformerFP8(FusedBlockMultiTransformer):
                 cache_v_zps[i] if cache_v_zps is not None else None,
                 None,  # linear_shifts
                 None,  # linear_smooths
+                kv_signal_data,
                 self._fuse_kernel_compute_dtype,
                 cache_quant_type_str,
                 self.use_neox_rotary_style,

@@ -53,6 +53,7 @@ std::vector<paddle::Tensor> AppendAttentionKernel(
     const paddle::optional<paddle::Tensor>& cache_v_zp,
     const paddle::optional<paddle::Tensor>& out_linear_shifts,
     const paddle::optional<paddle::Tensor>& out_linear_smooths,
+    const paddle::optional<paddle::Tensor>& kv_signal_data,
     const std::string& cache_quant_type_str,
     const bool use_neox_rotary_style,
     const int max_input_length,
@@ -140,6 +141,7 @@ std::vector<paddle::Tensor> AppendAttentionKernel(
           cache_v_quant_scales,
           cache_k_zp,
           cache_v_zp,
+          kv_signal_data,
           cache_quant_type_str,
           kv_num_blocks_data,
           max_input_length,
@@ -165,6 +167,7 @@ std::vector<paddle::Tensor> AppendAttentionKernel(
           qkv_bias,
           cache_k_quant_scales,
           cache_v_quant_scales,
+          kv_signal_data,
           cache_k_zp,
           cache_v_zp,
           cache_quant_type_str,
@@ -568,6 +571,7 @@ std::vector<paddle::Tensor> AppendAttention(
     const paddle::optional<paddle::Tensor>& cache_v_zp,
     const paddle::optional<paddle::Tensor>& out_linear_shifts,
     const paddle::optional<paddle::Tensor>& out_linear_smooths,
+    const paddle::optional<paddle::Tensor>& kv_signal_data,
     const std::string& compute_dtype,
     const std::string& cache_quant_type_str,
     const bool use_neox_rotary_style,
@@ -631,6 +635,7 @@ std::vector<paddle::Tensor> AppendAttention(
           cache_v_zp,
           out_linear_shifts,
           out_linear_smooths,
+          kv_signal_data,
           cache_quant_type_str,
           use_neox_rotary_style,
           max_input_length,
@@ -678,6 +683,7 @@ std::vector<paddle::Tensor> AppendAttention(
           cache_v_zp,
           out_linear_shifts,
           out_linear_smooths,
+          kv_signal_data,
           cache_quant_type_str,
           use_neox_rotary_style,
           max_input_length,
@@ -726,6 +732,7 @@ std::vector<paddle::Tensor> AppendAttention(
             cache_v_zp,
             out_linear_shifts,
             out_linear_smooths,
+            kv_signal_data,
             cache_quant_type_str,
             use_neox_rotary_style,
             max_input_length,
@@ -772,6 +779,7 @@ std::vector<paddle::Tensor> AppendAttention(
             cache_v_zp,
             out_linear_shifts,
             out_linear_smooths,
+            kv_signal_data,
             cache_quant_type_str,
             use_neox_rotary_style,
             max_input_length,
@@ -830,7 +838,8 @@ std::vector<std::vector<int64_t>> AppendAttentionInferShape(
     const paddle::optional<std::vector<int64_t>>& cache_k_zp_shape,
     const paddle::optional<std::vector<int64_t>>& cache_v_zp_shape,
     const paddle::optional<std::vector<int64_t>>& out_linear_shifts_shape,
-    const paddle::optional<std::vector<int64_t>>& out_linear_smooths_shape) {
+    const paddle::optional<std::vector<int64_t>>& out_linear_smooths_shape,
+    const paddle::optional<std::vector<int64_t>>& kv_signal_data_shape) {
   const int token_num = qkv_shape[0];
   const int kv_num_heads = key_cache_shape[1];
   const int head_dim = key_cache_shape[3];
@@ -873,6 +882,7 @@ std::vector<paddle::DataType> AppendAttentionInferDtype(
     const paddle::optional<paddle::DataType>& cache_v_zp_dtype,
     const paddle::optional<paddle::DataType>& out_linear_shifts_dtype,
     const paddle::optional<paddle::DataType>& out_linear_smooths_dtype,
+    const paddle::optional<paddle::DataType>& kv_signal_data_dtype,
     const std::string& compute_dtype,
     const std::string& cache_quant_type_str,
     const bool use_neox_rotary_style,
@@ -946,7 +956,8 @@ PD_BUILD_OP(append_attention)
              paddle::Optional("cache_k_zp"),
              paddle::Optional("cache_v_zp"),
              paddle::Optional("out_linear_shifts"),
-             paddle::Optional("out_linear_smooths")})
+             paddle::Optional("out_linear_smooths"),
+             paddle::Optional("kv_signal_data")})
     .Outputs({"fmha_out", "qkv_out", "key_cache_out", "value_cache_out"})
     .SetInplaceMap({{"key_cache", "key_cache_out"},
                     {"value_cache", "value_cache_out"}})

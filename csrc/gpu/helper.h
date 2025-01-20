@@ -151,6 +151,20 @@ public:
   typedef paddle::bfloat16 data_t;
 };
 
+template <>
+class PDTraits<paddle::DataType::INT8> {
+public:
+  typedef int8_t DataType;
+  typedef int8_t data_t;
+};
+
+template <>
+class PDTraits<paddle::DataType::UINT8> {
+public:
+  typedef uint8_t DataType;
+  typedef uint8_t data_t;
+};
+
 template <typename T, int Size>
 struct alignas(sizeof(T) * Size) AlignedVector {
   T val[Size];

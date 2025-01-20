@@ -132,10 +132,16 @@ nvcc_compile_args += [
     "-Ithird_party/cutlass/tools/util/include",
     "-Ithird_party/nlohmann_json/single_include",
     "-Igpu/sample_kernels",
+    "-Igpu/pd_disaggregation"
 ]
 
 cc = get_sm_version()
 cuda_version = float(paddle.version.cuda())
+
+sources += [
+    "./gpu/pd_disaggregation/alloc_cache_pinned.cc",
+    "./gpu/pd_disaggregation/swap_cache_batch.cu",
+]
 
 if cc >= 80:
     sources += ["gpu/int8_gemm_with_cutlass/gemm_dequant.cu"]
@@ -145,6 +151,13 @@ if cc >= 80:
         "./gpu/append_attn/get_block_shape_and_split_kv_block.cu",
         "./gpu/append_attn/decoder_write_cache_with_rope_kernel.cu",
         "./gpu/append_attn/speculate_write_cache_with_rope_kernel.cu",
+        "./gpu/pd_disaggregation/remote_cache_kv_ipc.cc",
+        "./gpu/pd_disaggregation/open_shm_and_get_meta_signal.cc",
+        "./gpu/pd_disaggregation/ipc_sent_key_value_cache_by_remote_ptr.cu",
+        "./gpu/pd_disaggregation/init_signal_layerwise.cc",
+        "./gpu/pd_disaggregation/get_data_ptr_ipc.cu",
+        "./gpu/pd_disaggregation/set_data_ipc.cu",
+        "./gpu/pd_disaggregation/set_mask_value.cu"
     ]
     sources += find_end_files("./gpu/append_attn/template_instantiation", ".cu")
 
