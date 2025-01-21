@@ -16,8 +16,6 @@
 #include "encoder_write_cache_with_rope_impl.cuh"
 #include "remote_cache_kv_ipc.h"
 
-using cache_write_compelete_signal_type = RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise_meta_data;
-
 template <typename T, typename QKV_TYPE>
 void EncoderWriteCacheWithRopeKernel(
     const AppendAttnMetaData& meta_data,
@@ -160,10 +158,7 @@ void EncoderWriteCacheWithRopeKernel(
       (std::strcmp(fmt_write_cache_completed_signal_str, "true") == 0 ||
        std::strcmp(fmt_write_cache_completed_signal_str, "1") == 0)) {
       if (kv_signal_data) {
-        cache_write_compelete_signal_type* kv_signal_data_tmp = reinterpret_cast<cache_write_compelete_signal_type*>(const_cast<int8_t*>(kv_signal_data.get().data<int8_t>()));
-        cudaLaunchHostFunc(qkv.stream(), 
-                          &RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise, 
-                          (void*)kv_signal_data_tmp);
+        RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise((void*)(const_cast<int64_t*>(kv_signal_data.get().data<int64_t>())));
       }
   }
 }

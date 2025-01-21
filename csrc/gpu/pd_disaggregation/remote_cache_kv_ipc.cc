@@ -38,11 +38,10 @@ RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise_meta_data RemoteCache
     int32_t* write_signal_ptr = reinterpret_cast<int32_t*>(signal_ptr);
     *write_signal_ptr = -1;
     using type_meta_data = RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise_meta_data;
-    #ifdef REMOTE_CACHE_KV_DEBUG
-        std::printf("#### open_shm_and_get_compelete_signal_meta_data layer idx:%d, to ptx:%p \n", 
-                    -1, ptr);
-    #endif
-    
+
+    // std::printf("#### open_shm_and_get_compelete_signal_meta_data layer idx:%d, to ptx:%p \n", 
+    //             -1, signal_ptr);
+
     type_meta_data meta_data(
         -1,
         signal_ptr,
@@ -73,13 +72,10 @@ RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise_meta_data RemoteCache
 }
 
 void CUDART_CB RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise(void* meta_data){
-    using type_meta_data = RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise_meta_data;
-    type_meta_data * meta_data_ptr = reinterpret_cast<type_meta_data*>(meta_data);
-    int32_t layer_id = meta_data_ptr->layer_id;
-    #ifdef REMOTE_CACHE_KV_DEBUG
-    std::printf("#### save_cache_kv_compelete_signal_layerwise layer idx:%d, to ptx:%p \n", 
-                layer_id, meta_data_ptr->shm_ptr);
-    #endif
-    int32_t* ptr = reinterpret_cast<int32_t*>(meta_data_ptr->shm_ptr);
+    int64_t* meta_data_ptr = reinterpret_cast<int64_t*>(meta_data);
+    int32_t layer_id = meta_data_ptr[0];
+    // std::printf("#### save_cache_kv_compelete_signal_layerwise layer idx:%d, to ptx:%p \n", 
+    //             layer_id, meta_data_ptr[1]);
+    int32_t* ptr = reinterpret_cast<int32_t*>(meta_data_ptr[1]);
     *ptr = layer_id;
 }

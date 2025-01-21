@@ -14,24 +14,20 @@ std::vector<paddle::Tensor> OpenShmAndGetMetaSignal(const int rank) {
         kv_signal_metadata = RemoteCacheKvIpc::open_shm_and_get_compelete_signal_meta_data(rank);
     }
 
-    int meatedata_size = sizeof(kv_signal_metadata);
-    phi::DenseTensorMeta dmeta(phi::DataType::INT8, phi::make_ddim({meatedata_size}));
-    std::shared_ptr<phi::Allocation> alloc(new phi::Allocation((void*)(&kv_signal_metadata), meatedata_size, phi::CPUPlace()));
-    auto out_kv_signal_metadata = paddle::Tensor(std::make_shared<phi::DenseTensor>(alloc, dmeta));
-
-    return {out_kv_signal_metadata};
+    auto kv_signal_metadata_out = paddle::full({3}, -1, paddle::DataType::INT64, paddle::CPUPlace());
+    kv_signal_metadata_out.data<int64_t>()[0] = static_cast<int64_t>(kv_signal_metadata.layer_id);
+    kv_signal_metadata_out.data<int64_t>()[1] = reinterpret_cast<int64_t>(kv_signal_metadata.shm_ptr);
+    kv_signal_metadata_out.data<int64_t>()[2] = static_cast<int64_t>(kv_signal_metadata.shm_fd);
+    return {kv_signal_metadata_out};
 }
 
 
 std::vector<std::vector<int64_t>> OpenShmAndGetMetaSignalShape(const int rank) {
-    cache_write_compelete_signal_type kv_signal_metadata;
-    int meatedata_size = sizeof(kv_signal_metadata);
-    std::vector<int64_t> kv_signal_metadata_shape = {meatedata_size};
-    return {kv_signal_metadata_shape};
+    return {{3}};
 }
 
 std::vector<paddle::DataType> OpenShmAndGetMetaSignalDtype(const int rank) {
-    return {paddle::DataType::INT8};
+    return {paddle::DataType::INT64};
 }
 
 PD_BUILD_OP(open_shm_and_get_meta_signal)
