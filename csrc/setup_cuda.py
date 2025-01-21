@@ -141,6 +141,7 @@ cuda_version = float(paddle.version.cuda())
 sources += [
     "./gpu/pd_disaggregation/alloc_cache_pinned.cc",
     "./gpu/pd_disaggregation/swap_cache_batch.cu",
+    "./gpu/pd_disaggregation/step_system_cache.cu"
 ]
 
 if cc >= 80:

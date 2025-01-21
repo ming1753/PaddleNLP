@@ -248,3 +248,24 @@ inline uint32_t get_encoder_block_shape_q() {
             encoder_block_shape_q_env == nullptr ? 64 : std::stoi(std::string(encoder_block_shape_q_env));
     return encoder_block_shape_q;
 }
+
+__global__ void free_and_dispatch_block(bool *stop_flags,
+                                        int *seq_lens_this_time,
+                                        int *seq_lens_decoder,
+                                        int *block_tables,
+                                        int *encoder_block_lens,
+                                        bool *is_block_step,
+                                        int *step_block_list,  // [bsz]
+                                        int *step_len,
+                                        int *recover_block_list,
+                                        int *recover_len,
+                                        int *need_block_list,
+                                        int *need_block_len,
+                                        int *used_list_len,
+                                        int *free_list,
+                                        int *free_list_len,
+                                        int64_t *first_token_ids,
+                                        const int bsz,
+                                        const int block_size,
+                                        const int block_num_per_seq,
+                                        const int max_decoder_block_num);
