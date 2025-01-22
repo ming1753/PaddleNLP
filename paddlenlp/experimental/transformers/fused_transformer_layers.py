@@ -1439,17 +1439,21 @@ class FusedMultiTransformerBase(Layer):
                 kwargs["decoder_tile_ids_per_batch"],
                 kwargs["decoder_num_blocks"],
                 kwargs["max_len_kv"],
+                set_max_lengths,
             ) = get_block_shape_and_split_kv_block(
                 kwargs.get("seq_lens_encoder", None),
                 kwargs.get("seq_lens_decoder", None),
-                max_enc_len_this_time,
-                max_dec_len_this_time,
                 kwargs.get("seq_lens_this_time", None),
                 kwargs.get("cum_offsets", None),
                 self.num_heads // self.kv_num_heads,
                 kwargs.get("block_size", 64),
                 self.config.speculate_config.speculate_max_draft_token_num,
             )
+
+            '''set_max_lengths: max_len_this_time, max_enc_len_this_time, max_dec_len_this_time,
+            max_enc_dec_len_this_time, max_just_dec_len_this_time, max_just_dec_merged_len_this_time,
+            max_system_len, max_just_dec_len_without_system'''
+            kwargs["set_max_lengths"] = set_max_lengths
 
         residual_input = src
         for i in range(self.num_layers):
@@ -2755,8 +2759,7 @@ class FusedBlockMultiTransformer(FusedMultiTransformerBase):
                 kwargs.get("decoder_batch_ids", None),
                 kwargs.get("decoder_tile_ids_per_batch", None),
                 kwargs.get("decoder_num_blocks", None),
-                kwargs.get("max_enc_len_this_time", None),
-                kwargs.get("max_dec_len_this_time", None),
+                kwargs.get("set_max_lengths", None),
                 kwargs.get("max_len_kv", None),
                 rotary_embs,
                 None,  # attn_mask
@@ -2957,8 +2960,7 @@ class FusedBlockMultiTransformerA8W8(FusedBlockMultiTransformer, FusedMultiTrans
                 kwargs.get("decoder_batch_ids", None),
                 kwargs.get("decoder_tile_ids_per_batch", None),
                 kwargs.get("decoder_num_blocks", None),
-                kwargs.get("max_enc_len_this_time", None),
-                kwargs.get("max_dec_len_this_time", None),
+                kwargs.get("set_max_lengths", None),
                 kwargs.get("max_len_kv", None),
                 rotary_embs,
                 None,  # attn_mask
@@ -3319,8 +3321,7 @@ class FusedBlockMultiTransformerFP8(FusedBlockMultiTransformer):
                 kwargs.get("decoder_batch_ids", None),
                 kwargs.get("decoder_tile_ids_per_batch", None),
                 kwargs.get("decoder_num_blocks", None),
-                kwargs.get("max_enc_len_this_time", None),
-                kwargs.get("max_dec_len_this_time", None),
+                kwargs.get("set_max_lengths", None),
                 kwargs.get("max_len_kv", None),
                 rotary_embs,
                 None,  # attn_mask
