@@ -74,8 +74,8 @@ RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise_meta_data RemoteCache
 void CUDART_CB RemoteCacheKvIpc::save_cache_kv_compelete_signal_layerwise(void* meta_data){
     int64_t* meta_data_ptr = reinterpret_cast<int64_t*>(meta_data);
     int32_t layer_id = meta_data_ptr[0];
-    // std::printf("#### save_cache_kv_compelete_signal_layerwise layer idx:%d, to ptx:%p \n", 
-    //             layer_id, meta_data_ptr[1]);
     int32_t* ptr = reinterpret_cast<int32_t*>(meta_data_ptr[1]);
     *ptr = layer_id;
+    // std::printf("#### save_cache_kv_compelete_signal_layerwise layer idx:%d, to ptx:%p \n", 
+    //             *ptr, meta_data_ptr[1]);
 }
