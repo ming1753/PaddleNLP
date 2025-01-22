@@ -634,6 +634,7 @@ class FusedMultiTransformerBase(Layer):
             self._add_parameter(ffn_ln_bias)
             self._add_parameter(ffn1_bias)
             self._add_parameter(ffn2_bias)
+            self._add_parameter(e_score_correction_bias)
 
             self._add_parameter(cache_k_scale)
             self._add_parameter(cache_v_scale)
@@ -686,7 +687,7 @@ class FusedMultiTransformerBase(Layer):
                     q_a_layernorm_weight = self.create_parameter(
                         shape=[self.config.mla_config.q_lora_rank],
                         attr=q_a_layernorm_weight_attr,
-                        dtype=self._dtype,
+                        dtype=self._norm_weight_dtype,
                         is_bias=False,
                     )
                     q_b_proj_weight = self.create_parameter(
@@ -711,7 +712,7 @@ class FusedMultiTransformerBase(Layer):
                 kv_a_layernorm_weight = self.create_parameter(
                     shape=[self.config.mla_config.kv_lora_rank],
                     attr=kv_a_layernorm_weight_attr,
-                    dtype=self._dtype,
+                    dtype=self._norm_weight_dtype,
                     is_bias=False,
                 )
                 kv_b_proj_weight = self.create_parameter(
@@ -1008,17 +1009,11 @@ class FusedMultiTransformerBase(Layer):
             key[..., : self.config.mla_config.qk_nope_head_dim] = key_nope
             key[..., self.config.mla_config.qk_nope_head_dim :] = key_pe
 
-            # query = paddle.nn.functional.pad(query, [0, 192 - self.config.mla_config.qk_head_dim], value=0)
-            # key = paddle.nn.functional.pad(key, [0, 192 - self.config.mla_config.qk_head_dim], value=0)
-            value = paddle.nn.functional.pad(
-                value, [0, self.config.mla_config.qk_head_dim - self.config.mla_config.v_head_dim], value=0
-            )
-
             qkv_out = paddle.concat(
                 [
                     query.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
                     key.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
-                    value.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
+                    value.reshape([-1, self.num_heads * self.config.mla_config.v_head_dim]),
                 ],
                 axis=-1,
             )
@@ -1237,10 +1232,6 @@ class FusedMultiTransformerBase(Layer):
                 self.ffn2_weights_scale[i] if hasattr(self, "ffn2_weights_scale") else None,
                 self.quant_type if hasattr(self, "quant_type") else "None",
             )
-
-            # ffn1_biases要拆分tp的各个卡上，或者只在0卡上，省略此处reduce，减少一次reduce
-            if self.nranks > 1:
-                dist.all_reduce(ffn_out)
 
             fused_moe_out = moe_reduce(
                 ffn_out,
@@ -1915,17 +1906,11 @@ class FusedMultiTransformerWeightOnly(FusedMultiTransformerBase):
             key[..., : self.config.mla_config.qk_nope_head_dim] = key_nope
             key[..., self.config.mla_config.qk_nope_head_dim :] = key_pe
 
-            # query = paddle.nn.functional.pad(query, [0, 192 - self.config.mla_config.qk_head_dim], value=0)
-            # key = paddle.nn.functional.pad(key, [0, 192 - self.config.mla_config.qk_head_dim], value=0)
-            value = paddle.nn.functional.pad(
-                value, [0, self.config.mla_config.qk_head_dim - self.config.mla_config.v_head_dim], value=0
-            )
-
             qkv_out = paddle.concat(
                 [
                     query.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
                     key.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
-                    value.reshape([-1, self.num_heads * self.config.mla_config.qk_head_dim]),
+                    value.reshape([-1, self.num_heads * self.config.mla_config.v_head_dim]),
                 ],
                 axis=-1,
             )
@@ -2870,8 +2855,6 @@ class FusedBlockMultiTransformer(FusedMultiTransformerBase):
                 )[0]
 
         if self.config.mla_config.use_mla():
-            fmha_out = fmha_out.reshape([-1, self.num_heads, self.config.mla_config.qk_head_dim])
-            fmha_out = fmha_out[:, :, : self.config.mla_config.v_head_dim]
             fmha_out = fmha_out.reshape([-1, self.num_heads * self.config.mla_config.v_head_dim])
 
         out_linear_out = self.compute_out_linear(fmha_out, i)

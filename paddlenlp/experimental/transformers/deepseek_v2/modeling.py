@@ -359,6 +359,8 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
                     name=f"fuse{self.base_model_prefix}.{idx}.e_score_correction_bias",
                     initializer=paddle.nn.initializer.Constant(value=0),
                 )
+                if idx >= self.config.first_k_dense_replace
+                else None
                 for idx in range(self.num_layers)
             ]
 
@@ -553,7 +555,7 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
                 ).cast(dtype)
                 q_a_layernorm_weight = paddle.to_tensor(
                     state_dict[f"{self.base_model_prefix}.layers.{idx}.self_attn.q_a_layernorm.weight"]
-                ).cast(dtype)
+                ).cast(self.transformer_block.q_a_layernorm_weights[idx].dtype)
                 q_b_proj_weight = paddle.to_tensor(
                     state_dict[f"{self.base_model_prefix}.layers.{idx}.self_attn.q_b_proj.weight"]
                 ).cast(dtype)
@@ -592,7 +594,7 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
             ).cast(dtype)
             kv_a_layernorm_weight = paddle.to_tensor(
                 state_dict[f"{self.base_model_prefix}.layers.{idx}.self_attn.kv_a_layernorm.weight"]
-            ).cast(dtype)
+            ).cast(self.transformer_block.kv_a_layernorm_weights[idx].dtype)
             kv_b_proj_weight = paddle.to_tensor(
                 state_dict[f"{self.base_model_prefix}.layers.{idx}.self_attn.kv_b_proj.weight"]
             ).cast(dtype)
@@ -667,28 +669,34 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
                 ffn2_weights = []
                 ffn1_scales = []
                 ffn2_scales = []
+
                 for expert_idx in range(self.n_routed_experts):
-                    up_weight = paddle.to_tensor(
-                        state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.experts.{expert_idx}.up_proj.weight"]
-                    ).cast(dtype)
-                    gate_weight = paddle.to_tensor(
-                        state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.experts.{expert_idx}.gate_proj.weight"]
-                    ).cast(dtype)
-                    down_weight = paddle.to_tensor(
+                    concated_gate_up_weight = np.concatenate(
+                        [
+                            state_dict[
+                                f"{self.base_model_prefix}.layers.{idx}.mlp.experts.{expert_idx}.gate_proj.weight"
+                            ],
+                            state_dict[
+                                f"{self.base_model_prefix}.layers.{idx}.mlp.experts.{expert_idx}.up_proj.weight"
+                            ],
+                        ],
+                        axis=-1,
+                    )
+                    ffn1_weight = paddle.to_tensor(concated_gate_up_weight).cast(dtype)
+                    ffn2_weight = paddle.to_tensor(
                         state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.experts.{expert_idx}.down_proj.weight"]
                     ).cast(dtype)
 
                     if self.use_weight_only:
-                        ffn1_weight = paddle.concat(x=[gate_weight, up_weight], axis=-1)
                         ffn1_quanted_weight, ffn1_weight_scale = weight_quantize(ffn1_weight, algo=self.quant_algo)
-                        ffn2_quanted_weight, ffn2_weight_scale = weight_quantize(down_weight, algo=self.quant_algo)
+                        ffn2_quanted_weight, ffn2_weight_scale = weight_quantize(ffn2_weight, algo=self.quant_algo)
                         ffn1_weights.append(ffn1_quanted_weight.reshape([self.transformer_block.config.embed_dim, -1]))
                         ffn2_weights.append(ffn2_quanted_weight.reshape([-1, self.transformer_block.config.embed_dim]))
                         ffn1_scales.append(ffn1_weight_scale)
                         ffn2_scales.append(ffn2_weight_scale)
                     else:
-                        ffn1_weights.append(paddle.concat(x=[gate_weight, up_weight], axis=-1))
-                        ffn2_weights.append(down_weight)
+                        ffn1_weights.append(ffn1_weight)
+                        ffn2_weights.append(ffn2_weight)
 
                 fused_moe_ffn1_weight = paddle.to_tensor(ffn1_weights)
                 fused_moe_ffn2_weight = paddle.to_tensor(ffn2_weights)
@@ -712,15 +720,14 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
                     self.transformer_block.ffn1_weights_scale[idx].set_value(fused_moe_ffn1_weight_scale)
                     self.transformer_block.ffn2_weights_scale[idx].set_value(fused_moe_ffn2_weight_scale)
 
-                shared_expert_ffn1gate_weight = paddle.to_tensor(
-                    state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.shared_experts.gate_proj.weight"]
-                ).cast(dtype)
-                shared_expert_ffn1up_weight = paddle.to_tensor(
-                    state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.shared_experts.up_proj.weight"]
-                ).cast(dtype)
-                shared_expert_ffn1_weight = paddle.concat(
-                    x=[shared_expert_ffn1gate_weight, shared_expert_ffn1up_weight], axis=-1
+                concated_gate_up_weight = np.concatenate(
+                    [
+                        state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.shared_experts.gate_proj.weight"],
+                        state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.shared_experts.up_proj.weight"],
+                    ],
+                    axis=-1,
                 )
+                shared_expert_ffn1_weight = paddle.to_tensor(concated_gate_up_weight).cast(dtype)
                 shared_expert_ffn2_weight = paddle.to_tensor(
                     state_dict[f"{self.base_model_prefix}.layers.{idx}.mlp.shared_experts.down_proj.weight"]
                 ).cast(dtype)
@@ -772,7 +779,6 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
     ):
 
         seq_lens_this_time = kwargs.get("seq_lens_this_time", None)
-        rope_emb = kwargs.get("rope_emb", None)
         draft_tokens = kwargs.get("draft_tokens", None)
         seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
 
@@ -795,7 +801,7 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
                 attn_mask=attention_mask,
                 caches=caches,
                 pre_caches=pre_caches,
-                rotary_embs=rope_emb,
+                rotary_embs=None,
                 **kwargs,
             )
         hidden_states = self.norm(hidden_states)
@@ -873,6 +879,11 @@ class DeepseekV2ForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, De
             base_actions["layers.0.mlp.shared_experts.gate_proj.weight"] = partial(fn, is_column=True)
             base_actions["layers.0.mlp.shared_experts.down_proj.weight"] = partial(fn, is_column=False)
 
+            # MTP parts
+            base_actions["layers.61.embed_tokens.weight"] = partial(fn, is_column=False)
+            base_actions["layers.61.eh_proj.weight"] = partial(fn, is_column=True)
+            base_actions["layers.61.shared_head.head.weight"] = partial(fn, is_column=True)
+
             for key, action in base_actions.items():
                 if "layers.0." in key:
                     for i in range(num_layers):
@@ -910,14 +921,20 @@ class DeepseekV2ForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, De
 
         cache_kvs = []
         for _ in range(config.num_hidden_layers):
-            cache_kv_shape = [
+            cache_k_shape = [
                 max_block_nums,
                 config.num_key_value_heads // max(config.tensor_parallel_degree, 1),
                 config.block_size,
                 config.qk_nope_head_dim + config.qk_rope_head_dim,
             ]
-            cache_kvs.append(cache_kv_shape)
-            cache_kvs.append(cache_kv_shape)
+            cache_v_shape = [
+                max_block_nums,
+                config.num_key_value_heads // max(config.tensor_parallel_degree, 1),
+                config.block_size,
+                config.v_head_dim,
+            ]
+            cache_kvs.append(cache_k_shape)
+            cache_kvs.append(cache_v_shape)
         return cache_kvs
 
     def prepare_inputs_for_generation(self, **kwargs):
@@ -929,7 +946,6 @@ class DeepseekV2ForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, De
         pre_caches = kwargs.get("pre_caches", None)
         caches = kwargs.get("caches", None)
 
-        rope_emb = kwargs["rope_emb"]
         seq_lens_this_time = kwargs["seq_lens_this_time"]
         seq_lens_encoder = kwargs["seq_lens_encoder"]
         seq_lens_decoder = kwargs["seq_lens_decoder"]
@@ -945,7 +961,7 @@ class DeepseekV2ForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, De
         model_inputs = {
             "input_ids": input_ids,
             "src_mask": src_mask,
-            "rope_emb": rope_emb,
+            "rope_emb": None,
             "pre_caches": pre_caches,
             "caches": caches,
             "seq_lens_this_time": seq_lens_this_time,
@@ -983,7 +999,7 @@ class DeepseekV2ForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, De
             input_ids,
             src_mask=src_mask,
             caches=caches,
-            rope_emb=rope_emb,
+            rope_emb=None,
             block_tables=block_tables,
             pre_caches=pre_caches,
             seq_lens_this_time=seq_lens_this_time,
