@@ -1406,12 +1406,6 @@ class FusedMultiTransformerBase(Layer):
 
         assert self.num_layers == len(self.linear_weights)
 
-        max_enc_len_this_time, max_dec_len_this_time = self.compute_max_len(
-            kwargs.get("seq_lens_encoder", None), kwargs.get("seq_lens_decoder", None), cum_offsets
-        )
-        kwargs["max_enc_len_this_time"] = max_enc_len_this_time
-        kwargs["max_dec_len_this_time"] = max_dec_len_this_time
-
         if self.use_pd_disaggregation:
             kv_signal_metadata = open_shm_and_get_meta_signal(self.rank)
 
@@ -1445,6 +1439,12 @@ class FusedMultiTransformerBase(Layer):
             max_enc_dec_len_this_time, max_just_dec_len_this_time, max_just_dec_merged_len_this_time,
             max_system_len, max_just_dec_len_without_system'''
             kwargs["set_max_lengths"] = set_max_lengths
+        else:
+            max_enc_len_this_time, max_dec_len_this_time = self.compute_max_len(
+                kwargs.get("seq_lens_encoder", None), kwargs.get("seq_lens_decoder", None), cum_offsets
+            )
+            kwargs["max_enc_len_this_time"] = max_enc_len_this_time
+            kwargs["max_dec_len_this_time"] = max_dec_len_this_time
 
         residual_input = src
         for i in range(self.num_layers):
