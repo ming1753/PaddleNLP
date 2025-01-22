@@ -727,9 +727,9 @@ class GenerationBlockInferenceModel(GenerationMixin):
             if self.config.tensor_parallel_degree > 1:
                 paddle.distributed.broadcast(next_tokens, 0)
 
-            from paddlenlp_ops import update_inputs_v2
-
             with paddle.base.framework._stride_in_no_check_dy2st_diff():
+                from paddlenlp_ops import update_inputs_v2
+
                 update_inputs_v2(
                     model_kwargs["stop_flags"],
                     model_kwargs["step_idx"],
@@ -757,6 +757,8 @@ class GenerationBlockInferenceModel(GenerationMixin):
 
         # encoder
         outputs = _forward_(**model_kwargs)  # [bs, 1, dim_embed]
+        if os.getenv("FLAGS_fmt_write_cache_completed_signal") is not None:
+            os.environ["FLAGS_fmt_write_cache_completed_signal"] = "0"
         # first decoder
         next_tokens = _post_process_(
             outputs,
