@@ -757,8 +757,6 @@ class GenerationBlockInferenceModel(GenerationMixin):
 
         # encoder
         outputs = _forward_(**model_kwargs)  # [bs, 1, dim_embed]
-        if os.getenv("FLAGS_fmt_write_cache_completed_signal") is not None:
-            os.environ["FLAGS_fmt_write_cache_completed_signal"] = "0"
         # first decoder
         next_tokens = _post_process_(
             outputs,
