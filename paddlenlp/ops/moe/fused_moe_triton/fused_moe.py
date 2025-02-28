@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
+
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
@@ -24,32 +25,31 @@ from typing import Any, Dict, List, Optional, Tuple
 import paddle
 import triton
 import triton.language as tl
-
-
-from paddlemix.triton_ops import get_dtype_str, paddle_use_triton
-from paddlemix.triton_ops import rendering_common_template
-from paddle.base.framework import OpProtoHolder
-from paddle.framework import in_dynamic_or_pir_mode
 from paddle import _C_ops
+from paddle.base.framework import OpProtoHolder
 from paddle.base.layer_helper import LayerHelper
+from paddle.framework import in_dynamic_or_pir_mode
+from paddlemix.triton_ops import (
+    get_dtype_str,
+    paddle_use_triton,
+    rendering_common_template,
+)
 
 padding_size = 0
 
 
-@paddle_use_triton(key=["1"],)
-def put_along_axis_kernel(
-    A,
-    index,
-    batch,
-    top1: tl.constexpr,
-    top2: tl.constexpr):
+@paddle_use_triton(
+    key=["1"],
+)
+def put_along_axis_kernel(A, index, batch, top1: tl.constexpr, top2: tl.constexpr):
 
     id = tl.program_id(0)
     index_ptr = index + id * top2
     for i in range(top2):
-        offset = tl.load(index_ptr+i)
+        offset = tl.load(index_ptr + i)
         write_offset = A + id * top1 + offset
         tl.store(write_offset, 1.0)
+
 
 def put_along_axis_triton_api(A, index):
     op_name = "put_along_axis_triton_api"
@@ -71,19 +71,13 @@ def put_along_axis_triton_api(A, index):
         };
         """
         template_used = rendering_common_template(
-            put_along_axis_triton_api, 
-            prepare_attr_for_triton_kernel, 
-            prepare_ptr_for_triton_kernel, 
+            put_along_axis_triton_api,
+            prepare_attr_for_triton_kernel,
+            prepare_ptr_for_triton_kernel,
         )
         grid = ("batch",)
 
-        put_along_axis_kernel[(op_name, template_used, grid)](
-            A,
-            index,
-            -1,
-            top1,
-            top2
-        )
+        put_along_axis_kernel[(op_name, template_used, grid)](A, index, -1, top1, top2)
     if in_dynamic_or_pir_mode():
         outs = _C_ops._run_custom_op(op_name, A, index)
         return outs[0]
@@ -102,8 +96,6 @@ def put_along_axis_triton_api(A, index):
             outputs=outputs,
         )
         return useless
-
-
 
 
 # 可以使用凯伦算子代替
@@ -151,7 +143,9 @@ def _per_token_group_quant_fp8(
 
 
 # 可以使用凯伦算子代替
-@paddle_use_triton(key=["1"],)
+@paddle_use_triton(
+    key=["1"],
+)
 def _per_token_group_quant_fp8_kernel(
     # Pointers to inputs and output
     y_ptr,
@@ -242,16 +236,16 @@ std::vector<paddle::DataType> ${op_name}_InferDtype(const paddle::DataType& A_dt
 
 """
 
+
 def per_token_group_quant_fp8_api(
     x,
-    group_size =  -1,
-    eps = 1e-10,
-): 
+    group_size=-1,
+    eps=1e-10,
+):
     fp8_max, fp8_min = 448.0, -448.0
     assert len(x.shape) == 2
 
     N = group_size
-
 
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
@@ -259,7 +253,7 @@ def per_token_group_quant_fp8_api(
     num_stages = 1
 
     config = {
-        "num_warps" : num_warps,
+        "num_warps": num_warps,
         "num_stages": num_stages,
     }
 
@@ -298,11 +292,11 @@ def per_token_group_quant_fp8_api(
         """
         return_tensor_names = "x_q, x_s"
         template_used = rendering_common_template(
-            per_token_group_quant_fp8_api, 
-            prepare_attr_for_triton_kernel, 
-            prepare_ptr_for_triton_kernel, 
+            per_token_group_quant_fp8_api,
+            prepare_attr_for_triton_kernel,
+            prepare_ptr_for_triton_kernel,
             return_tensor_names,
-            d2s_infer_code
+            d2s_infer_code,
         )
         grid = ("M",)
 
@@ -337,7 +331,7 @@ def per_token_group_quant_fp8_api(
             type=op_name,
             inputs=inputs,
             outputs=outputs,
-            attrs = attrs,
+            attrs=attrs,
         )
         return x_q, x_s
 
@@ -528,8 +522,9 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-
-@paddle_use_triton(key=["1"],)
+@paddle_use_triton(
+    key=["1"],
+)
 def fused_moe_kernel_zkk(
     # Pointers to matrices
     a_ptr,
@@ -715,6 +710,7 @@ def fused_moe_kernel_zkk(
 
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
+
 def ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -801,14 +797,14 @@ def moe_align_block_size_stage4(
         tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
 
 
-
-
-@paddle_use_triton(key=["1"],)
+@paddle_use_triton(
+    key=["1"],
+)
 def moe_align_block_size_stage1_zkk(
     topk_ids_ptr,
     tokens_cnts_ptr,
-    numel ,
-    tokens_per_thread ,
+    numel,
+    tokens_per_thread,
     num_experts: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -824,7 +820,9 @@ def moe_align_block_size_stage1_zkk(
             tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
 
 
-@paddle_use_triton(key=["1"],)
+@paddle_use_triton(
+    key=["1"],
+)
 def moe_align_block_size_stage2_zkk(
     tokens_cnts_ptr,
     num_experts: tl.constexpr,
@@ -838,7 +836,9 @@ def moe_align_block_size_stage2_zkk(
         tl.store(tokens_cnts_ptr + i * num_experts + pid, last_cnt)
 
 
-@paddle_use_triton(key=["1"],)
+@paddle_use_triton(
+    key=["1"],
+)
 def moe_align_block_size_stage3_zkk(
     total_tokens_post_pad_ptr,
     tokens_cnts_ptr,
@@ -855,7 +855,9 @@ def moe_align_block_size_stage3_zkk(
     tl.store(total_tokens_post_pad_ptr, last_cumsum)
 
 
-@paddle_use_triton(key=["1"],)
+@paddle_use_triton(
+    key=["1"],
+)
 def moe_align_block_size_stage4_zkk(
     topk_ids_ptr,
     sorted_token_ids_ptr,
@@ -921,7 +923,7 @@ def invoke_fused_moe_kernel(
         else:
             block_k = block_shape[1]
             A, A_scale = per_token_group_quant_fp8_api(A, block_k)
-            
+
             # from paddlenlp_ops import group_quant
             # A, A_scale = group_quant(
             #     A, group_size=128, transpose_scale=False, quant_max_bound=448.0, quant_min_bound=-448.0
@@ -929,7 +931,7 @@ def invoke_fused_moe_kernel(
             # assert 128 == block_k
 
             # A, A_scale = per_token_group_quant_fp8(A, block_k)
-            
+
             # print((my_scale-A_scale).max().abs())
             # print(my_A.cast("float32") - A.cast("float32"))
 
@@ -948,8 +950,8 @@ def invoke_fused_moe_kernel(
         A,
         B,
         C,  # out
-        A_scale, #a1_scale
-        B_scale, # w1_sacle
+        A_scale,  # a1_scale
+        B_scale,  # w1_sacle
         topk_weights,
         topk_ids,
         sorted_token_ids,
@@ -960,10 +962,11 @@ def invoke_fused_moe_kernel(
         use_fp8_w8a8,
         use_int8_w8a16,
         even_Ks,
-        config)
+        config,
+    )
 
     assert compute_type == tl.bfloat16
-    '''
+    """
     fused_moe_kernel[grid](
         A,
         B,
@@ -1000,27 +1003,28 @@ def invoke_fused_moe_kernel(
         even_Ks=(int)(even_Ks),
         **config,
     )
-    '''
-    
+    """
+
     # assert ((C-C1).abs().max() * 100).cast("int32").item() == 0
+
 
 def invoke_fused_moe_kernel_api(
     A,
     B,
     C,  # out
-    A_scale, #a1_scale
-    B_scale, # w1_sacle
+    A_scale,  # a1_scale
+    B_scale,  # w1_sacle
     topk_weights,
     topk_ids,
     sorted_token_ids,
     expert_ids,
     num_tokens_post_padded,
-    mul_routed_weight = False,
-    top_k = -1,
-    use_fp8_w8a8 = False,
-    use_int8_w8a16 = False,
-    even_Ks = False,
-    config = [],
+    mul_routed_weight=False,
+    top_k=-1,
+    use_fp8_w8a8=False,
+    use_int8_w8a16=False,
+    even_Ks=False,
+    config=[],
 ) -> None:
     prepare_attr_for_triton_kernel = """
             auto N = B.shape()[1];
@@ -1046,15 +1050,15 @@ def invoke_fused_moe_kernel_api(
     """
 
     config = {
-        'BLOCK_SIZE_M': config["BLOCK_SIZE_M"], 
-        'BLOCK_SIZE_N': config["BLOCK_SIZE_N"], 
-        'BLOCK_SIZE_K': config["BLOCK_SIZE_K"], 
-        'GROUP_SIZE_M': config["GROUP_SIZE_M"], 
-        'num_warps': config["num_warps"], 
-        'num_stages': config["num_stages"], 
+        "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
+        "BLOCK_SIZE_N": config["BLOCK_SIZE_N"],
+        "BLOCK_SIZE_K": config["BLOCK_SIZE_K"],
+        "GROUP_SIZE_M": config["GROUP_SIZE_M"],
+        "num_warps": config["num_warps"],
+        "num_stages": config["num_stages"],
     }
     configs = []
-    
+
     # for num_warps in [4, 8]:
     #     for block_size_k in [64, 128]:
     #         for block_size_n in [64, 128, 256]:
@@ -1065,7 +1069,7 @@ def invoke_fused_moe_kernel_api(
     #             configs.append(tmp)
     if B.shape[1] == 256:
         config["BLOCK_SIZE_K"] = 128
-    
+
     configs.append(dict(config))
 
     op_name = "fused_moe_zkk"
@@ -1098,7 +1102,7 @@ def invoke_fused_moe_kernel_api(
             prepare_attr_for_triton_kernel,
             prepare_ptr_for_triton_kernel,
         )
-        grid = ("(EM+BLOCK_SIZE_M-1)/BLOCK_SIZE_M * ((N+BLOCK_SIZE_N-1)/BLOCK_SIZE_N)", )
+        grid = ("(EM+BLOCK_SIZE_M-1)/BLOCK_SIZE_M * ((N+BLOCK_SIZE_N-1)/BLOCK_SIZE_N)",)
         padded_size = 0
 
         assert len(A.shape) == 2
@@ -1118,20 +1122,21 @@ def invoke_fused_moe_kernel_api(
             num_tokens_post_padded,
             B.shape[1],
             B.shape[2] - padded_size,
-            -1, # sorted_token_ids.shape[0],
-            -1, # topk_ids.shape[0] * topk_ids.shape[1],
-            A.shape[1], # A.strides[0],
-            1, # A.strides[1],
-            B.shape[1] * B.shape[2], # B.strides[0],
-            1, # B.strides[2],
-            B.shape[2], # B.strides[1], 
-            B.shape[1], # C.shape[2], # C.strides[1],
-            1, # C.strides[2],
-            A_scale.shape[1], # A_scale.strides[0] if A_scale is not None and A_scale.dim() == 2 else 0,
-            1, # A_scale.strides[1] if A_scale is not None and A_scale.dim() == 2 else 0,
-            B_scale.shape[1] * B_scale.shape[2], # B_scale.strides[0] if B_scale is not None and B_scale.dim() >= 2 else 0, 
-            1, # B_scale.strides[2] if B_scale is not None and B_scale.dim() == 3 else 0,
-            B_scale.shape[2], # B_scale.strides[1] if B_scale is not None and B_scale.dim() >= 2 else 0,
+            -1,  # sorted_token_ids.shape[0],
+            -1,  # topk_ids.shape[0] * topk_ids.shape[1],
+            A.shape[1],  # A.strides[0],
+            1,  # A.strides[1],
+            B.shape[1] * B.shape[2],  # B.strides[0],
+            1,  # B.strides[2],
+            B.shape[2],  # B.strides[1],
+            B.shape[1],  # C.shape[2], # C.strides[1],
+            1,  # C.strides[2],
+            A_scale.shape[1],  # A_scale.strides[0] if A_scale is not None and A_scale.dim() == 2 else 0,
+            1,  # A_scale.strides[1] if A_scale is not None and A_scale.dim() == 2 else 0,
+            B_scale.shape[1]
+            * B_scale.shape[2],  # B_scale.strides[0] if B_scale is not None and B_scale.dim() >= 2 else 0,
+            1,  # B_scale.strides[2] if B_scale is not None and B_scale.dim() == 3 else 0,
+            B_scale.shape[2],  # B_scale.strides[1] if B_scale is not None and B_scale.dim() >= 2 else 0,
             128,
             128,
             MUL_ROUTED_WEIGHT=(int)(mul_routed_weight),
@@ -1143,22 +1148,24 @@ def invoke_fused_moe_kernel_api(
         )
 
     if in_dynamic_or_pir_mode():
-        outs = _C_ops._run_custom_op(op_name, 
-                                     A,
-                                     B,
-                                     C,  # out
-                                     A_scale, #a1_scale
-                                     B_scale, # w1_sacle
-                                     topk_weights,
-                                     topk_ids,
-                                     sorted_token_ids,
-                                     expert_ids,
-                                     num_tokens_post_padded,
-                                     mul_routed_weight,
-                                     top_k,
-                                     use_fp8_w8a8,
-                                     use_int8_w8a16,
-                                     even_Ks)
+        outs = _C_ops._run_custom_op(
+            op_name,
+            A,
+            B,
+            C,  # out
+            A_scale,  # a1_scale
+            B_scale,  # w1_sacle
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            use_fp8_w8a8,
+            use_int8_w8a16,
+            even_Ks,
+        )
         return outs[0]
     else:
         helper = LayerHelper(op_name, **locals())
@@ -1174,17 +1181,19 @@ def invoke_fused_moe_kernel_api(
             "expert_ids": expert_ids,
             "num_tokens_post_padded": num_tokens_post_padded,
         }
-        attrs = {"mul_routed_weight": mul_routed_weight,
-                 "top_k": top_k,
-                 "use_fp8_w8a8": use_fp8_w8a8,
-                 "use_int8_w8a16": use_int8_w8a16,
-                 "even_Ks": even_Ks}
+        attrs = {
+            "mul_routed_weight": mul_routed_weight,
+            "top_k": top_k,
+            "use_fp8_w8a8": use_fp8_w8a8,
+            "use_int8_w8a16": use_int8_w8a16,
+            "even_Ks": even_Ks,
+        }
         useless = helper.create_variable_for_type_inference(dtype="int32")
         outputs = {"useless": useless}
         helper.append_op(
             type=op_name,
             inputs=inputs,
-            attrs = attrs,
+            attrs=attrs,
             outputs=outputs,
         )
         return useless
@@ -1402,7 +1411,8 @@ def fused_experts_impl(
     compute_type = tl.bfloat16 if hidden_states.dtype == paddle.bfloat16 else tl.float16
 
     from paddlenlp_ops import preprocess_for_moe
-    sorted_token_ids , expert_ids, num_tokens_post_padded = preprocess_for_moe(topk_ids, E, config["BLOCK_SIZE_M"])
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = preprocess_for_moe(topk_ids, E, config["BLOCK_SIZE_M"])
 
     invoke_fused_moe_kernel(
         hidden_states,
@@ -1470,7 +1480,7 @@ def fused_moe(
     a2_scale=None,
     block_shape: Optional[List[int]] = None,
     refactor: float = 1.0,
-    e_score_correction_bias = None,
+    e_score_correction_bias=None,
 ):
     # Check constraints.
     assert scores.shape[1] == w1.shape[0], "Number of experts mismatch"
@@ -1480,7 +1490,7 @@ def fused_moe(
 
     if e_score_correction_bias is not None:
         topk_weights = scores_no_bias.take_along_axis(topk_ids, axis=1)
-        
+
     # renormalize和refactor
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdim=True)

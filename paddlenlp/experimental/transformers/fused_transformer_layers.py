@@ -5173,7 +5173,9 @@ class FusedBlockMultiTransformerFP8DynamicQuant(FusedBlockMultiTransformer):
 
             group_mask = paddle.zeros_like(group_scores, dtype="int64")  # [n, num_expert_group]
             # group_mask = paddle.put_along_axis(group_mask, group_idx, paddle.to_tensor(1), axis=1)
-            from paddlenlp.ops.moe.fused_moe_triton.fused_moe import put_along_axis_triton_api
+            from paddlenlp.ops.moe.fused_moe_triton.fused_moe import (
+                put_along_axis_triton_api,
+            )
 
             put_along_axis_triton_api(group_mask, group_idx)
 
