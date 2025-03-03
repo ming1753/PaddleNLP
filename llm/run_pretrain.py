@@ -41,7 +41,6 @@ from paddlenlp.transformers import (
     AutoTokenizer,
     CosineAnnealingWithWarmupDecay,
     LinearAnnealingWithWarmupDecay,
-    register_sequence_parallel_allreduce_hooks,
 )
 from paddlenlp.transformers.configuration_utils import LlmMetaConfig, llmmetaclass
 from paddlenlp.utils.batch_sampler import DistributedBatchSampler
@@ -52,12 +51,7 @@ from paddlenlp.utils.tools import get_env_device
 os.environ["USE_CASUAL_MASK"] = "True"
 
 
-def add_start_docstrings(*docstr):
-    def docstring_decorator(fn):
-        fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
-        return fn
-
-    return docstring_decorator
+from paddlenlp.trainer.utils.doc import add_start_docstrings
 
 
 @dataclass
@@ -86,12 +80,8 @@ class PreTrainingArguments(TrainingArguments):
         metadata={"help": "Weather to run benchmark by autotuner. True for from_scratch and pad_max_length."},
     )
     unified_checkpoint: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Enable fused linear grad add strategy."},
-    )
-    unified_checkpoint_config: Optional[str] = field(
-        default="",
-        metadata={"help": "Configs to unify hybrid parallel checkpoint.\n"},
     )
 
     def __post_init__(self):
@@ -110,6 +100,7 @@ class PreTrainingArguments(TrainingArguments):
             self.report_to = []
             self.save_strategy = IntervalStrategy.NO
             self.evaluation_strategy = IntervalStrategy.NO
+            self.unified_checkpoint = False
 
 
 @dataclass
@@ -487,6 +478,13 @@ def main():
             except:
                 print("Not register llama pp reshard information.")
 
+    architectures_to_check = {"Qwen2Moe", "DeepseekV2", "DeepseekV3"}
+    if (
+        any(architecture in str(config.architectures) for architecture in architectures_to_check)
+        and training_args.data_parallel_degree > 1
+    ):
+        training_args.use_expert_parallel = True
+
     if model_args.continue_training:
         # NOTE(gongenlei): new add
         if training_args.autotuner_benchmark:
@@ -499,11 +497,6 @@ def main():
             )
     else:
         model = model_class.from_config(config, dtype=dtype)
-
-    if training_args.sequence_parallel:
-        register_sequence_parallel_allreduce_hooks(
-            model, training_args.gradient_accumulation_steps, training_args.fuse_sequence_parallel_allreduce
-        )
 
     if training_args.recompute:
         model.recompute_enable()

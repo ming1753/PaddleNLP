@@ -7,7 +7,7 @@
 ------------------------------------------------------------------------------------------
 
 <p align="center">
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202-dfd.svg"></a>
+    <a href="https://paddlenlp.readthedocs.io/en/latest/?badge=latest"><img src="https://readthedocs.org/projects/paddlenlp/badge/?version=latest">
     <a href="https://github.com/PaddlePaddle/PaddleNLP/releases"><img src="https://img.shields.io/github/v/release/PaddlePaddle/PaddleNLP?color=ffa"></a>
     <a href=""><img src="https://img.shields.io/badge/python-3.7+-aff.svg"></a>
     <a href=""><img src="https://img.shields.io/badge/os-linux%2C%20win%2C%20mac-pink.svg"></a>
@@ -16,6 +16,7 @@
     <a href="https://pypi.org/project/paddlenlp/"><img src="https://img.shields.io/pypi/dm/paddlenlp?color=9cf"></a>
     <a href="https://github.com/PaddlePaddle/PaddleNLP/issues"><img src="https://img.shields.io/github/issues/PaddlePaddle/PaddleNLP?color=9cc"></a>
     <a href="https://github.com/PaddlePaddle/PaddleNLP/stargazers"><img src="https://img.shields.io/github/stars/PaddlePaddle/PaddleNLP?color=ccf"></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202-dfd.svg"></a>
 </p>
 
 <h4 align="center">
@@ -52,6 +53,9 @@ The fine-tuning algorithms are deeply integrated with zero-padding data streams 
 
 The high-performance inference module of the large model toolkit incorporates dynamic insertion and operator fusion strategies throughout the entire process, greatly accelerating parallel inference speed. The underlying implementation details are encapsulated, enabling out-of-the-box high-performance parallel inference capabilities.
 
+## Documentation
+For detailed documentation, visit the [PaddleNLP Documentation](https://paddlenlp.readthedocs.io/).
+
 ------------------------------------------------------------------------------------------
 
 ## Support Models
@@ -68,7 +72,7 @@ Detailed list 👉 [Supported Model List](https://github.com/PaddlePaddle/Paddle
 ### Pip Installation
 
 ```shell
-pip install --upgrade paddlenlp==3.0.0b0
+pip install --upgrade paddlenlp==3.0.0b3
 ```
 
 or you can install the latest develop branch code with the following command:
@@ -93,13 +97,14 @@ PaddleNLP provides a convenient and easy-to-use Auto API, which can quickly load
 >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B", dtype="float16")
 >>> input_features = tokenizer("你好！请自我介绍一下。", return_tensors="pd")
 >>> outputs = model.generate(**input_features, max_length=128)
->>> print(tokenizer.batch_decode(outputs[0]))
+>>> print(tokenizer.batch_decode(outputs[0], skip_special_tokens=True))
 ['我是一个AI语言模型，我可以回答各种问题，包括但不限于：天气、新闻、历史、文化、科学、教育、娱乐等。请问您有什么需要了解的吗？']
 ```
 
 ### Pre-training for large language model
 
 ```shell
+git clone https://github.com/PaddlePaddle/PaddleNLP.git && cd PaddleNLP # if cloned or downloaded, can skip this step
 mkdir -p llm/data && cd llm/data
 wget https://bj.bcebos.com/paddlenlp/models/transformers/llama/data/llama_openwebtext_100k.bin
 wget https://bj.bcebos.com/paddlenlp/models/transformers/llama/data/llama_openwebtext_100k.idx
@@ -110,6 +115,7 @@ python -u -m paddle.distributed.launch --gpus "0,1,2,3,4,5,6,7" run_pretrain.py 
 ### SFT finetuning forlarge language model
 
 ```shell
+git clone https://github.com/PaddlePaddle/PaddleNLP.git && cd PaddleNLP # if cloned or downloaded, can skip this step
 mkdir -p llm/data && cd llm/data
 wget https://bj.bcebos.com/paddlenlp/datasets/examples/AdvertiseGen.tar.gz && tar -zxvf AdvertiseGen.tar.gz
 cd .. # change folder to PaddleNLP/llm
@@ -120,8 +126,8 @@ For more steps in the entire large model process, please refer to the[Large Mode
 
 For more PaddleNLP content, please refer to:
 
-* [Model Library](./legacy/model_zoo)，which includes end-to-end usage of high-quality pre-trained models.
-* [Multi-scenario Examples](./legacy/examples)，to understand how to use PaddleNLP to solve various NLP technical problems, including basic techniques, system applications, and extended applications.
+* [Model Library](./slm/model_zoo)，which includes end-to-end usage of high-quality pre-trained models.
+* [Multi-scenario Examples](./slm/examples)，to understand how to use PaddleNLP to solve various NLP technical problems, including basic techniques, system applications, and extended applications.
 * [Interactive Tutorial](https://aistudio.baidu.com/aistudio/personalcenter/thirdview/574995)，to quickly learn PaddleNLP on the free computing platform AI Studio.
 
 ------------------------------------------------------------------------------------------
@@ -137,7 +143,7 @@ To connect with other users and contributors, welcome to join our [Slack channel
 Scan the QR code below with your Wechat⬇️. You can access to official technical exchange group. Look forward to your participation.
 
 <div align="center">
-    <img src="https://user-images.githubusercontent.com/11987277/245085922-0aa68d24-00ff-442e-9c53-2f1e898151ce.png" width="150" height="150" />
+    <img src="https://github.com/user-attachments/assets/3a58cc9f-69c7-4ccb-b6f5-73e966b8051a" width="150" height="150" />
 </div>
 
 ## Citation

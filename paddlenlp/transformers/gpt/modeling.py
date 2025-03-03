@@ -53,6 +53,7 @@ from ..model_outputs import (
     TokenClassifierOutput,
 )
 from ..model_utils import dy2st_nocheck_guard_context
+from ..utils import caculate_llm_per_token_flops
 from .configuration import (
     GPT_PRETRAINED_INIT_CONFIGURATION,
     GPT_PRETRAINED_RESOURCE_FILES_MAP,
@@ -803,6 +804,37 @@ class GPTPretrainedModel(PretrainedModel):
     config_class = GPTConfig
     pretrained_init_configuration = GPT_PRETRAINED_INIT_CONFIGURATION
     pretrained_resource_files_map = GPT_PRETRAINED_RESOURCE_FILES_MAP
+
+    def _get_model_flops(self):
+        if hasattr(self.config, "seq_length"):
+            seq_length = self.config.seq_length
+        else:
+            seq_length = 2048
+
+        return caculate_llm_per_token_flops(
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            layer_num=self.config.num_hidden_layers,
+            vocab_size=self.config.vocab_size,
+            seq_length=seq_length,
+            recompute=False,
+        )
+
+    def _get_hardware_flops(self):
+        if hasattr(self.config, "seq_length"):
+            seq_length = self.config.seq_length
+        else:
+            seq_length = 2048
+
+        return caculate_llm_per_token_flops(
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            layer_num=self.config.num_hidden_layers,
+            vocab_size=self.config.vocab_size,
+            seq_length=seq_length,
+            recompute=self.config.recompute,
+            recompute_granularity=self.config.recompute_granularity,
+        )
 
     @classmethod
     def _get_tensor_parallel_mappings(cls, config, is_split=True):

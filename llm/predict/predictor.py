@@ -20,45 +20,47 @@ import time
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from threading import Thread
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import paddle
-import paddle.distributed.fleet.base.topology as tp
 import paddle.incubate.multiprocessing as mp
 from paddle.base.framework import in_cinn_mode, in_pir_executor_mode
 from paddle.distributed import fleet
-from utils.utils import (
-    dybatch_preprocess,
-    get_alibi_slopes,
-    get_infer_model_path,
-    get_model_max_position_embeddings,
-    get_prefix_tuning_params,
-    init_chat_template,
-    load_real_time_tokens,
-    read_res,
-)
 
+try:
+    from paddlenlp.experimental.transformers import (
+        EagleProposer,
+        InferenceWithReferenceProposer,
+        SpeculateArgument,
+    )
+except:
+    pass
 from paddlenlp.generation import GenerationConfig, TextIteratorStreamer
 from paddlenlp.peft import LoRAConfig, LoRAModel, PrefixConfig, PrefixModelForCausalLM
 from paddlenlp.taskflow.utils import static_mode_guard
 from paddlenlp.trainer import PdArgumentParser
 from paddlenlp.transformers import (
     AutoConfig,
+    AutoInferenceModelForCausalLM,
     AutoModelForCausalLM,
     AutoTokenizer,
     ChatGLMTokenizer,
     ChatGLMv2Tokenizer,
     Llama3Tokenizer,
     LlamaTokenizer,
-    PretrainedModel,
+    PretrainedConfig,
     PretrainedTokenizer,
 )
-from paddlenlp.utils.import_utils import import_module, is_paddlenlp_ops_available
+from paddlenlp.trl import llm_utils
+from paddlenlp.utils.env import (
+    MAX_BSZ,
+    MAX_DRAFT_TOKENS,
+    PADDLE_INFERENCE_MODEL_SUFFIX,
+    PADDLE_INFERENCE_WEIGHTS_SUFFIX,
+)
+from paddlenlp.utils.import_utils import is_paddlenlp_ops_available
 from paddlenlp.utils.log import logger
-
-# Note(@RochardWooSJTU): MAX_BSZ must be the same as definition in get_output / save_output
-MAX_BSZ = 512
 
 
 @dataclass
@@ -96,14 +98,24 @@ class PredictorArgument:
     inference_model: bool = field(default=False, metadata={"help": "whether use InferenceModel to do generation"})
     quant_type: str = field(
         default="",
-        metadata={"help": "Quantization type. Supported values: a8w8, a8w8c8, weight_only_int4, weight_only_int8"},
+        metadata={
+            "help": "Quantization type. Supported values: a8w8, a8w8c8, a8w8_fp8, a8w8c8_fp8, weight_only_int4, weight_only_int8"
+        },
     )
     avx_model: bool = field(
         default=False, metadata={"help": "whether use AvxModel to do generation when using cpu inference"}
     )
     avx_type: str = field(
         default=None,
-        metadata={"help": "avx compute type. Supported values: fp16, bf16"},
+        metadata={
+            "help": "avx compute type. Supported values: fp16, bf16,fp16_int8\
+        fp16: first_token and next_token run in fp16\
+        fp16_int8 : first_token run in fp16, next token run in int8"
+        },
+    )
+    avx_cachekv_type: str = field(
+        default="fp16",
+        metadata={"help": "avx cachekv type. Supported values: fp16,int8"},
     )
     batch_size: int = field(default=1, metadata={"help": "The batch size of data."})
     benchmark: bool = field(
@@ -112,7 +124,7 @@ class PredictorArgument:
             "help": "If benchmark set as `True`, we will force model decode to max_length, which is helpful to compute throughput. "
         },
     )
-
+    use_fake_parameter: bool = field(default=False, metadata={"help": "use fake parameter, for ptq scales now."})
     block_attn: bool = field(default=False, metadata={"help": "whether use block attention"})
     block_size: int = field(default=64, metadata={"help": "the block size for cache_kvs."})
     cachekv_int8_type: str = field(
@@ -121,6 +133,8 @@ class PredictorArgument:
             "help": "If cachekv_int8_type set as `dynamic`, cache kv would be quantized to int8 dynamically. If cachekv_int8_type set as `static`, cache kv would be quantized to int8 Statically."
         },
     )
+
+    append_attn: bool = field(default=False, metadata={"help": "whether use append attention"})
 
     chat_template: str = field(
         default=None,
@@ -133,9 +147,46 @@ class PredictorArgument:
         },
     )
 
-    @property
-    def total_max_length(self):
-        return self.src_length + self.max_length
+    total_max_length: int = field(
+        default=4096, metadata={"help": "Super parameter. Maximum sequence length(encoder+decoder)."}
+    )
+    speculate_method: str = field(
+        default=None,
+        metadata={
+            "help": "speculate method, it should be one of ['None', 'inference_with_reference', 'eagle', 'mtp']"
+        },
+    )
+    speculate_max_draft_token_num: int = field(
+        default=1,
+        metadata={"help": "the max length of draft tokens for speculate method."},
+    )
+    speculate_max_ngram_size: int = field(default=1, metadata={"help": "the max ngram size of speculate method."})
+    speculate_verify_window: int = field(
+        default=2, metadata={"help": "the max length of verify window for speculate method."}
+    )
+    speculate_max_candidate_len: int = field(default=5, metadata={"help": "the max length of candidate tokens."})
+    draft_model_name_or_path: str = field(default=None, metadata={"help": "The directory of eagle or draft model"})
+    draft_model_quant_type: str = field(
+        default="",
+        metadata={"help": "Draft model quantization type. Reserved for future"},
+    )
+    return_full_hidden_states: bool = field(default=False, metadata={"help": "whether return full hidden_states"})
+
+    mla_use_matrix_absorption: bool = field(default=False, metadata={"help": "implement mla with matrix-absorption."})
+    weightonly_group_size: int = field(default=-1, metadata={"help": "the max length of candidate tokens."})
+    weight_block_size: List[int] = field(
+        default_factory=lambda: [128, 128],
+        metadata={"help": "Quantitative granularity of weights. Supported values: [0, 0], [128, 128]"},
+    )
+
+    def __post_init__(self):
+        if self.speculate_method is not None:
+            self.append_attn = True
+        if self.append_attn:
+            self.block_attn = True
+        assert (
+            self.src_length + self.max_length <= self.total_max_length
+        ), "src_length + max_length should smaller than total_max_length."
 
 
 @dataclass
@@ -157,50 +208,6 @@ def batchfy_text(texts, batch_size):
     return batch_texts
 
 
-def init_dist_env():
-    tensor_parallel_degree = paddle.distributed.get_world_size()
-    tensor_parallel_rank = paddle.distributed.get_rank()
-
-    if tensor_parallel_degree > 1:
-        # refer to: https://github.com/PaddlePaddle/Paddle/blob/4abea956ee852ce52791a1e08fa92ed4d3be150d/python/paddle/distributed/fleet/fleet.py#L298C23-L298C45
-        hcg = tp._HYBRID_PARALLEL_GROUP
-        if hcg is None:
-            strategy = fleet.DistributedStrategy()
-            strategy.hybrid_configs = {
-                "dp_degree": 1,
-                "mp_degree": tensor_parallel_degree,
-                "pp_degree": 1,
-                "sharding_degree": 1,
-            }
-            fleet.init(is_collective=True, strategy=strategy)
-            hcg = fleet.get_hybrid_communicate_group()
-
-        tensor_parallel_rank = hcg.get_model_parallel_rank()
-    return tensor_parallel_rank, tensor_parallel_degree
-
-
-def get_eos_token_id(
-    tokenizer: PretrainedTokenizer, generation_config: Optional[GenerationConfig] = None
-) -> List[List[int]]:
-    """get eos_token_id from generation_config or tokenizer
-
-    Returns:
-        List[int]: eos_token_id to stop the generation
-    """
-    eos_token_ids = []
-    if tokenizer.eos_token_id is not None:
-        eos_token_ids.append(tokenizer.eos_token_id)
-
-    if generation_config is not None and generation_config.eos_token_id is not None:
-        if isinstance(generation_config.eos_token_id, int):
-            eos_token_ids.append(generation_config.eos_token_id)
-        else:
-            eos_token_ids.extend(generation_config.eos_token_id)
-
-    eos_token_ids_dict = {str(item): item for item in eos_token_ids}
-    return list(eos_token_ids_dict.values())
-
-
 class BasePredictor:
     def __init__(self, config: PredictorArgument, tokenizer: PretrainedTokenizer = None):
         self.model_config = AutoConfig.from_pretrained(config.model_name_or_path)
@@ -211,8 +218,11 @@ class BasePredictor:
         self.tokenizer = tokenizer
 
         self.return_tensors = "pd"
-        self.tensor_parallel_rank, self.tensor_parallel_degree = init_dist_env()
-        self.model_config.tensor_parallel_rank, self.model_config.tensor_parallel_degree = init_dist_env()
+        self.tensor_parallel_rank, self.tensor_parallel_degree = llm_utils.init_dist_env()
+        self.model_config.tensor_parallel_rank, self.model_config.tensor_parallel_degree = (
+            self.tensor_parallel_rank,
+            self.tensor_parallel_degree,
+        )
 
         try:
             self.generation_config = GenerationConfig.from_pretrained(config.model_name_or_path)
@@ -223,14 +233,25 @@ class BasePredictor:
             self.generation_config = None
 
     def _preprocess(self, source):
+
         if self.tokenizer.chat_template is not None:
-            source = [source] if isinstance(source, str) else source
+            # for str -> List[str] eg. "hello"
+            # for List[str] -> List[str]  eg. ["hello", "hello new"]
+            # for List[List[str]] -> List[List[List[str]]]  eg. 历史对话形式,一轮
+            #             [ [ "Hello, how are you?", "I'm doing great. How can I help you today?"],
+            #                ["I'd like to show off how chat templating works!"], ]
+            # for List[Dict] -> List[List[Dict]]  [{'role': 'user', 'content': 'hello'}, {'role': 'assistant', 'content': 'nice'}]
+            #                                 ->  [[{'role': 'user', 'content': 'hello'}, {'role': 'assistant', 'content': 'nice'}]]
+            if not isinstance(source, list) or not isinstance(source[0], str):
+                source = [source]
             source = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in source]
 
         tokenized_source = self.tokenizer(
             source,
             max_length=self.config.src_length,
             truncation=True,
+            return_position_ids=True if not isinstance(self.tokenizer, ChatGLMTokenizer) else False,
+            return_attention_mask=True,
             truncation_side="left",
             return_tensors=self.return_tensors,
             padding=True,
@@ -262,11 +283,9 @@ class BasePredictor:
 
 
 class DygraphPredictor(BasePredictor):
-    def __init__(
-        self, config: PredictorArgument, model: PretrainedModel = None, tokenizer: PretrainedTokenizer = None
-    ):
+    def __init__(self, config: PredictorArgument, tokenizer: PretrainedTokenizer = None, **kwargs):
         super().__init__(config, tokenizer)
-        self.model = model
+        self.model = kwargs.get("model", None)
         if config.lora_path is not None:
             lora_config = LoRAConfig.from_pretrained(config.lora_path)
             dtype = lora_config.dtype
@@ -293,7 +312,7 @@ class DygraphPredictor(BasePredictor):
             )
             self.model.merge()
         if config.prefix_path is not None:
-            prefix_tuning_params = get_prefix_tuning_params(self.model)
+            prefix_tuning_params = llm_utils.get_prefix_tuning_params(self.model)
             self.model = PrefixModelForCausalLM.from_pretrained(
                 model=self.model,
                 prefix_path=config.prefix_path,
@@ -307,7 +326,7 @@ class DygraphPredictor(BasePredictor):
             **inputs,
             max_new_tokens=self.config.max_length,
             bos_token_id=self.tokenizer.bos_token_id,
-            eos_token_id=get_eos_token_id(self.tokenizer, self.generation_config),
+            eos_token_id=llm_utils.get_eos_token_id(self.tokenizer, self.generation_config),
             pad_token_id=self.tokenizer.pad_token_id,
             decode_strategy=self.config.decode_strategy,
             temperature=self.config.temperature,
@@ -326,7 +345,7 @@ class DygraphPredictor(BasePredictor):
             streamer=text_streamer,
             max_new_tokens=self.config.max_length,
             bos_token_id=self.tokenizer.bos_token_id,
-            eos_token_id=get_eos_token_id(self.tokenizer, self.generation_config),
+            eos_token_id=llm_utils.get_eos_token_id(self.tokenizer, self.generation_config),
             pad_token_id=self.tokenizer.pad_token_id,
             decode_strategy=(
                 "greedy_search" if self.config.top_k == 1 and self.config.top_p == 1.0 else self.config.decode_strategy
@@ -343,7 +362,7 @@ class DygraphPredictor(BasePredictor):
 
 
 class StaticGraphPredictor(BasePredictor):
-    def __init__(self, config: PredictorArgument, tokenizer: PretrainedTokenizer = None):
+    def __init__(self, config: PredictorArgument, tokenizer: PretrainedTokenizer = None, **kwargs):
         super().__init__(config, tokenizer)
 
         inference_config = paddle.inference.Config(self.config.model_name_or_path, self.config.model_prefix)
@@ -357,6 +376,9 @@ class StaticGraphPredictor(BasePredictor):
             inference_config.disable_gpu()
         inference_config.disable_glog_info()
         inference_config.enable_new_executor()
+        # remove `gpu_cpu_map_matmul_v2_to_matmul_pass` to avoid mapping matmul_v2 -> matmul op
+        if config.dtype == "bfloat16":
+            inference_config.delete_pass("gpu_cpu_map_matmul_v2_to_matmul_pass")
         if in_pir_executor_mode():
             inference_config.enable_new_ir()
             if in_cinn_mode():
@@ -410,7 +432,7 @@ class InferencePredictorMixin(BasePredictor):
             self.tgt_pos = None
         else:
             self.cache_kvs = [paddle.zeros(shape, dtype=self.dtype) for shape in self.cache_kvs_shape]
-            self.num_layers, self.num_attention_heads, self.head_dim = (
+            self.num_layers, self.num_key_value_heads, self.head_dim = (
                 len(self.cache_kvs),
                 self.cache_kvs[0].shape[-3],
                 self.cache_kvs[0].shape[-1],
@@ -446,7 +468,7 @@ class InferencePredictorMixin(BasePredictor):
                             self.num_layers,
                             2,
                             config.batch_size,
-                            self.num_attention_heads,
+                            self.num_key_value_heads,
                             prefix_cache.shape[-2],
                             self.head_dim,
                         ],
@@ -456,7 +478,7 @@ class InferencePredictorMixin(BasePredictor):
                     ]
                 else:
                     prefix_cache = paddle.zeros(
-                        [self.num_layers, 2, config.batch_size, self.num_attention_heads, 128, self.head_dim],
+                        [self.num_layers, 2, config.batch_size, self.num_key_value_heads, 128, self.head_dim],
                         dtype=self.dtype,
                     )
                     self.pre_caches = [
@@ -465,7 +487,7 @@ class InferencePredictorMixin(BasePredictor):
 
     def _postprocess(self, predictions, return_tokens=False):
         if paddle.distributed.get_rank() == 0:
-            tokens: np.ndarray = load_real_time_tokens()
+            tokens: np.ndarray = llm_utils.load_real_time_tokens()
             decoded_predictions = self.tokenizer.batch_decode(
                 tokens.tolist(), skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
@@ -484,10 +506,11 @@ class InferencePredictorMixin(BasePredictor):
         pre_caches_length = 0 if not self.config.export_precache else self.pre_caches[0].shape[-2]
 
         if self.tokenizer.chat_template is not None:
-            source = [source] if isinstance(source, str) else source
+            if not isinstance(source, list) or not isinstance(source[0], str):
+                source = [source]
             source = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in source]
 
-        inputs = dybatch_preprocess(
+        inputs = llm_utils.dybatch_preprocess(
             self.tokenizer,
             source,
             self.config.src_length,
@@ -495,7 +518,7 @@ class InferencePredictorMixin(BasePredictor):
             self.architectures,
             top_p=self.config.top_p,
             temperature=self.config.temperature,
-            eos_token_id=get_eos_token_id(self.tokenizer, self.generation_config),
+            eos_token_id=llm_utils.get_eos_token_id(self.tokenizer, self.generation_config),
             benchmark=self.config.benchmark,
             pre_caches_length=pre_caches_length,
         )
@@ -546,10 +569,10 @@ class InferencePredictorMixin(BasePredictor):
 
             inputs["tgt_pos"] = inputs["tgt_pos"] + pre_caches_length
             # alibi encoder
-            alibi_slopes = get_alibi_slopes(self.model_config.n_head)
+            alibi_slopes = llm_utils.get_alibi_slopes(self.model_config.n_head)
             inputs["position_ids"] = paddle.to_tensor(alibi_slopes, dtype="float32")
             arange_tensor_encoder = paddle.arange(self.config.total_max_length, dtype=self.config.dtype)
-            alibi = alibi_slopes[None, :, None, None] * arange_tensor_encoder
+            alibi = (alibi_slopes[None, :, None, None] * arange_tensor_encoder).astype(self.config.dtype)
 
             if self.model_config.tensor_parallel_degree > 1:
                 block_size = self.model_config.n_head // self.model_config.tensor_parallel_degree
@@ -637,14 +660,16 @@ class InferencePredictorMixin(BasePredictor):
         return inputs
 
 
-class StaticInferencePredictor(InferencePredictorMixin):
+class StaticGraphInferencePredictor(InferencePredictorMixin):
     def __init__(
         self,
         config: PredictorArgument,
-        cache_kvs_shape: list[list[int]],
         tokenizer: PretrainedTokenizer = None,
+        **kwargs,
     ):
-        self.cache_kvs_shape = cache_kvs_shape
+        self.cache_kvs_shape = kwargs.get("cache_kvs_shape", None)
+        if self.cache_kvs_shape is None:
+            raise ValueError("cache_kvs_shape should be provided for StaticGraphInferencePredictor")
         InferencePredictorMixin.__init__(self, config, tokenizer)
 
         self.predictor = self._create_predictor(config)
@@ -656,20 +681,14 @@ class StaticInferencePredictor(InferencePredictorMixin):
                 "https://github.com/PaddlePaddle/PaddleNLP/blob/develop/csrc/README.md"
             )
 
-        # register the custome ops
-        if predictor_args.device == "cpu" and predictor_args.avx_model:
-            import_module("paddlenlp_ops.xft_llama_layer")
-        else:
-            import_module("paddlenlp_ops.encode_rotary_qk")
-            import_module("paddlenlp_ops.get_padding_offset")
-            import_module("paddlenlp_ops.qkv_transpose_split")
-            import_module("paddlenlp_ops.rebuild_padding")
-            import_module("paddlenlp_ops.transpose_remove_padding")
-            import_module("paddlenlp_ops.write_cache_kv")
+        infer_model_path = llm_utils.get_infer_model_path(
+            predictor_args.model_name_or_path, predictor_args.model_prefix
+        )
 
-        infer_model_path = get_infer_model_path(predictor_args.model_name_or_path, predictor_args.model_prefix)
-
-        config = paddle.inference.Config(infer_model_path + ".pdmodel", infer_model_path + ".pdiparams")
+        config = paddle.inference.Config(
+            infer_model_path + PADDLE_INFERENCE_MODEL_SUFFIX,
+            infer_model_path + PADDLE_INFERENCE_WEIGHTS_SUFFIX,
+        )
 
         config.switch_ir_optim(True)
         # remove `gpu_cpu_map_matmul_v2_to_matmul_pass` to avoid mapping matmul_v2 -> matmul op
@@ -686,23 +705,13 @@ class StaticInferencePredictor(InferencePredictorMixin):
             )
         elif predictor_args.device == "cpu" and predictor_args.avx_model:
             config.disable_gpu()
-            config.switch_ir_optim(False)
+            config.enable_new_ir()
+            config.disable_mkldnn()
+            config.disable_glog_info()
         else:
             device_id = int(os.environ.get("FLAGS_selected_gpus", 0))
             config.enable_use_gpu(100, device_id)
         config.enable_new_executor()
-
-        if self.tensor_parallel_degree > 1:
-            trainer_endpoints = fleet.worker_endpoints()
-            current_endpoint = trainer_endpoints[self.tensor_parallel_rank]
-
-            dist_config = config.dist_config()
-            dist_config.set_ranks(self.tensor_parallel_degree, self.tensor_parallel_rank)
-            dist_config.set_endpoints(trainer_endpoints, current_endpoint)
-            dist_config.enable_dist_model(True)
-
-            dist_config.set_comm_init_config(os.path.join(predictor_args.model_name_or_path, "rank_mapping.csv"))
-            config.set_dist_config(dist_config)
 
         predictor = paddle.inference.create_predictor(config)
         return predictor
@@ -732,9 +741,12 @@ class DygraphInferencePredictor(InferencePredictorMixin):
     def __init__(
         self,
         config: PredictorArgument,
-        model: PretrainedModel = None,
         tokenizer: PretrainedTokenizer = None,
+        **kwargs,
     ):
+        model = kwargs.get("model", None)
+        if model is None:
+            raise ValueError("model should be provided for DygraphInferencePredictor")
         self.cache_kvs_shape = model.get_cache_kvs_shape(model.config, config.batch_size, config.total_max_length)
         InferencePredictorMixin.__init__(self, config, tokenizer)
         self.model = model
@@ -752,20 +764,19 @@ class DygraphInferencePredictor(InferencePredictorMixin):
                 inputs[key] = paddle.to_tensor(inputs[key])
 
         inputs["cache_kvs"] = self.cache_kvs
-        self.model.generate(
+        return self.model.generate(
             **inputs,
         )
-        return None
 
 
 class BlockInferencePredictorMixin(BasePredictor):
     def __init__(self, config: PredictorArgument, tokenizer: PretrainedTokenizer):
         BasePredictor.__init__(self, config, tokenizer)
 
-        self.num_layers = len(self.cache_kvs_shape) // 2
-        self.num_attention_heads = self.cache_kvs_shape[0][-3]
-        self.head_dim = self.cache_kvs_shape[0][-1]
-        self.max_block_nums = self.cache_kvs_shape[0][0]
+        self.num_layers = len(self.cache_k_shapes)
+        self.num_key_value_heads = self.cache_k_shapes[0][-3]
+        self.head_dim = self.cache_k_shapes[0][-1]
+        self.max_block_nums = self.cache_k_shapes[0][0]
         self.batch_size = config.batch_size
         self.model_name_or_path = config.model_name_or_path
 
@@ -773,12 +784,8 @@ class BlockInferencePredictorMixin(BasePredictor):
 
         self.dtype = config.dtype or self.model_config.dtype
 
-        try:
-            self.rope_theta = self.model_config.rope_theta
-            self.rope_scaling = self.model_config.rope_scaling
-        except:
-            self.rope_theta = 10000.0
-            self.rope_scaling = None
+        self.rope_theta = self.model_config.get("rope_theta", 10000.0)
+        self.rope_scaling = self.model_config.get("rope_scaling", None)
 
         self.pre_cache_length = 0
 
@@ -788,7 +795,7 @@ class BlockInferencePredictorMixin(BasePredictor):
             config.max_length -= self.pre_cache_length
             self.pre_caches = [
                 paddle.zeros(
-                    [config.batch_size, self.num_attention_heads, self.pre_cache_length, self.head_dim],
+                    [config.batch_size, self.num_key_value_heads, self.pre_cache_length, self.head_dim],
                     dtype=self.dtype,
                 )
                 for _ in range(2 * self.num_layers)
@@ -812,19 +819,19 @@ class BlockInferencePredictorMixin(BasePredictor):
 
         if config.cachekv_int8_type == "dynamic":
             self.k_quant_scales = [
-                paddle.zeros([config.batch_size, self.num_attention_heads], dtype="float32")
+                paddle.zeros([config.batch_size, self.num_key_value_heads], dtype="float32")
                 for _ in range(self.num_layers)
             ]
             self.v_quant_scales = [
-                paddle.zeros([config.batch_size, self.num_attention_heads], dtype="float32")
+                paddle.zeros([config.batch_size, self.num_key_value_heads], dtype="float32")
                 for _ in range(self.num_layers)
             ]
             self.k_dequant_scales = [
-                paddle.zeros([config.batch_size, self.num_attention_heads], dtype="float32")
+                paddle.zeros([config.batch_size, self.num_key_value_heads], dtype="float32")
                 for _ in range(self.num_layers)
             ]
             self.v_dequant_scales = [
-                paddle.zeros([config.batch_size, self.num_attention_heads], dtype="float32")
+                paddle.zeros([config.batch_size, self.num_key_value_heads], dtype="float32")
                 for _ in range(self.num_layers)
             ]
 
@@ -858,7 +865,7 @@ class BlockInferencePredictorMixin(BasePredictor):
             shape=[config.batch_size, 1], fill_value=config.temperature, dtype="float32"
         )
         self.model_inputs["eos_token_id"] = paddle.to_tensor(
-            np.array(get_eos_token_id(self.tokenizer, self.generation_config)).reshape(-1, 1).astype("int64")
+            np.array(llm_utils.get_eos_token_id(self.tokenizer, self.generation_config)).reshape(-1, 1).astype("int64")
         )
         self.model_inputs["penalty_score"] = paddle.full(
             shape=[config.batch_size, 1], fill_value=config.repetition_penalty, dtype="float32"
@@ -875,7 +882,7 @@ class BlockInferencePredictorMixin(BasePredictor):
         self.model_inputs["max_length"] = paddle.full(
             shape=[config.batch_size, 1], fill_value=config.max_length, dtype="int64"
         )
-        self.model_inputs["rope_emb"] = self._get_rotary_position_embedding(
+        self.model_inputs["rope_emb"] = llm_utils.get_rotary_position_embedding(
             paddle.arange(config.total_max_length).reshape((1, -1)), self.head_dim, self.rope_theta, self.rope_scaling
         )
         self.model_inputs["bad_tokens"] = paddle.to_tensor([-1], dtype="int64")
@@ -892,7 +899,7 @@ class BlockInferencePredictorMixin(BasePredictor):
                 shape=[config.batch_size, 1, 1, config.total_max_length], fill_value=1, dtype=self.dtype
             )
             arange_tensor_encoder = paddle.arange(config.total_max_length).astype(self.dtype)
-            alibi_slopes = get_alibi_slopes(self.num_attention_heads)
+            alibi_slopes = llm_utils.get_alibi_slopes(self.num_key_value_heads)
             alibi = alibi_slopes[None, :, None, None] * arange_tensor_encoder
             alibi_encoder = alibi.tile([config.batch_size, 1, config.total_max_length, 1])
             alibi_decoder = alibi.tile(
@@ -910,61 +917,42 @@ class BlockInferencePredictorMixin(BasePredictor):
             self.model_inputs["tgt_mask"] = (
                 alibi_decoder + (1 - self.model_inputs["tgt_mask"]) * paddle.finfo(self.dtype).min
             ).cast(self.dtype)
-
-    def _get_rotary_position_embedding(self, position_ids, head_dim, rope_theta=10000.0, rope_scaling: dict = None):
-        """
-        Pre-calculate rotary position embedding for position_ids.
-
-        Args:
-            position_ids: [1, S]
-            head_dim: D
-
-        Returns:
-            rot_emb: [2, 1, S, 1, D], cos + sin
-        """
-        bsz, max_seq_len = position_ids.shape[:2]
-        rot_emb = paddle.zeros((2, bsz, max_seq_len, 1, head_dim), dtype="float32")
-        inv_freq = rope_theta ** (-paddle.arange(0, head_dim, 2, dtype="float32") / head_dim)
-
-        if rope_scaling is not None:
-            rope_type = rope_scaling.get("rope_type", None)
-            if rope_type is not None and rope_type == "llama3":
-                factor = rope_scaling.get("factor", 8.0)
-                low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
-                high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
-                original_max_position_embeddings = rope_scaling.get("original_max_position_embeddings", 8192)
-
-                low_freq_wavelen = original_max_position_embeddings / low_freq_factor
-                high_freq_wavelen = original_max_position_embeddings / high_freq_factor
-                new_freqs = []
-                for freq in inv_freq:
-                    import math
-
-                    wavelen = 2 * math.pi / freq
-                    if wavelen < high_freq_wavelen:
-                        new_freqs.append(freq)
-                    elif wavelen > low_freq_wavelen:
-                        new_freqs.append(freq / factor)
-                    else:
-                        assert low_freq_wavelen != high_freq_wavelen
-                        smooth = (original_max_position_embeddings / wavelen - low_freq_factor) / (
-                            high_freq_factor - low_freq_factor
-                        )
-                        new_freqs.append((1 - smooth) * freq / factor + smooth * freq)
-                inv_freq = paddle.to_tensor(new_freqs, dtype=inv_freq.dtype)
-
-        # shape: [B, S, D/2]
-        freqs = paddle.einsum("ij,k->ijk", position_ids.cast("float32"), inv_freq)
-        # shape: [B, S, 1, D]
-        emb = paddle.concat([freqs, freqs], axis=-1).reshape((bsz, max_seq_len, 1, head_dim))
-
-        rot_emb[0] = paddle.cos(emb)
-        rot_emb[1] = paddle.sin(emb)
-        return rot_emb
+        elif config.device == "npu" and self.model_config.get("alibi", False):
+            lower_one_tril = paddle.tril(
+                paddle.ones(shape=(config.total_max_length, config.total_max_length), dtype=self.dtype)
+            )
+            lower_one_tril = lower_one_tril[None, None, :, :]
+            src_mask = lower_one_tril.tile([config.batch_size, 1, 1, 1])
+            tgt_mask = paddle.full(
+                shape=[config.batch_size, 1, 1, config.total_max_length], fill_value=1, dtype=self.dtype
+            )
+            arange_tensor_encoder = paddle.arange(config.total_max_length).astype(self.dtype)
+            alibi_slopes = llm_utils.get_alibi_slopes(self.num_key_value_heads)
+            alibi = alibi_slopes[None, :, None, None] * arange_tensor_encoder
+            alibi_encoder = alibi.tile([config.batch_size, 1, config.total_max_length, 1])
+            alibi_decoder = alibi.tile(
+                [
+                    config.batch_size,
+                    1,
+                    1,
+                    1,
+                ]
+            )
+            # self.model_inputs["src_mask/tgt_mask"] is read only, will not be updated!
+            src_mask = (alibi_encoder + (1 - src_mask) * paddle.finfo(self.dtype).min).cast(self.dtype)
+            tgt_mask = (alibi_decoder + (1 - tgt_mask) * paddle.finfo(self.dtype).min).cast(self.dtype)
+            self.model_inputs["rope_emb"] = paddle.concat([src_mask.reshape([-1]), tgt_mask.reshape([-1])])
 
     def _preprocess(self, input_text: list[str]):
+        len_input_text = len(input_text)
+        if len_input_text < self.batch_size:
+            padding_len = self.batch_size - len_input_text
+            input_text += [""] * padding_len
+            assert len(input_text) == self.batch_size
+
         if self.tokenizer.chat_template is not None:
-            input_text = [input_text] if isinstance(input_text, str) else input_text
+            if not isinstance(input_text, list) or not isinstance(input_text[0], str):
+                input_text = [input_text]
             input_text = [self.tokenizer.apply_chat_template(sentence, tokenize=False) for sentence in input_text]
 
         input_ids = []
@@ -981,25 +969,29 @@ class BlockInferencePredictorMixin(BasePredictor):
             )
             input_ids.append(tokens["input_ids"][0])
 
-        seq_lens = self.pad_batch_data(input_ids)
+        self.seq_lens = self.pad_batch_data(input_ids)
         self.model_inputs["input_ids"] = self.input_ids
 
         self.model_inputs["block_tables"][:][:] = -1
         free_list = list(range(self.max_block_nums))
         for i in range(self.config.batch_size):
             for j in range(
-                (seq_lens[i] + self.config.max_length + self.config.block_size - 1) // self.config.block_size
+                (self.seq_lens[i] + self.config.max_length + self.config.block_size - 1) // self.config.block_size
             ):
                 used_block_id = free_list.pop()
                 self.model_inputs["block_tables"][i, j] = used_block_id
 
-        self.model_inputs["seq_lens_this_time"] = paddle.to_tensor(np.array(seq_lens).astype("int32").reshape(-1, 1))
-        self.model_inputs["seq_lens_encoder"] = paddle.to_tensor(np.array(seq_lens).astype("int32").reshape(-1, 1))
+        self.model_inputs["seq_lens_this_time"] = paddle.to_tensor(
+            np.array(self.seq_lens).astype("int32").reshape(-1, 1)
+        )
+        self.model_inputs["seq_lens_encoder"] = paddle.to_tensor(
+            np.array(self.seq_lens).astype("int32").reshape(-1, 1)
+        )
         self.model_inputs["seq_lens_decoder"] = paddle.full(
             shape=[self.config.batch_size, 1], fill_value=0, dtype="int32"
         )
         self.model_inputs["step_idx"] = paddle.full(shape=[self.config.batch_size, 1], fill_value=0, dtype="int64")
-        self.model_inputs["not_need_stop"] = paddle.full(shape=[1], fill_value=True, dtype="bool")
+        self.model_inputs["not_need_stop"] = paddle.full(shape=[1], fill_value=True, dtype="bool").cpu()  # cpu
         self.model_inputs["stop_flags"] = paddle.full(
             shape=[self.config.batch_size, 1], fill_value=False, dtype="bool"
         )
@@ -1009,23 +1001,57 @@ class BlockInferencePredictorMixin(BasePredictor):
         )
         self.model_inputs["next_tokens"] = paddle.full(shape=[self.config.batch_size, 1], fill_value=-1, dtype="int64")
 
+        # speculative decoding related parameters
+        if self.config.speculate_method is not None:
+            self.model_inputs["accept_tokens"] = paddle.full(
+                shape=[self.config.batch_size, self.config.speculate_max_draft_token_num + 1],
+                fill_value=0,
+                dtype="int64",
+            )
+            self.model_inputs["accept_num"] = paddle.full(shape=[self.config.batch_size], fill_value=0, dtype="int32")
+            self.model_inputs["draft_tokens"] = paddle.full(
+                shape=[self.config.batch_size, self.config.speculate_max_draft_token_num + 1],
+                fill_value=0,
+                dtype="int64",
+            )
+            self.model_inputs["actual_draft_token_num"] = paddle.full(
+                shape=[self.config.batch_size], fill_value=self.config.speculate_max_draft_token_num, dtype="int32"
+            )
+
+            self.proposer.input_ids_cpu = self.model_inputs["input_ids"].to("cpu", blocking=False)
+            for bid in range(self.config.batch_size):
+                self.model_inputs["pre_ids"][bid, 0] = self.model_inputs["input_ids"][bid][
+                    self.seq_lens[bid] - 1
+                ]  # get the last token before padding of this batch
+                if self.config.speculate_method == "inference_with_reference":
+                    self.proposer.input_ids_len[bid, 0] = self.seq_lens[bid]
+
         if self.config.mode == "static":
             for k, v in self.model_inputs.items():
                 v.name = k
 
 
 class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
-    def __init__(
-        self,
-        config: PredictorArgument,
-        model: PretrainedModel = None,
-        tokenizer: PretrainedTokenizer = None,
-    ):
-        self.cache_kvs_shape = model.get_cache_kvs_shape(model.config, config.batch_size)
+    def __init__(self, config: PredictorArgument, tokenizer: PretrainedTokenizer = None, **kwargs):
+        model = kwargs.get("model", None)
+        self.return_full_hidden_states = config.return_full_hidden_states
+        self.full_hidden_states = None
+        if model is None:
+            raise ValueError("model should be provided for DygraphBlockInferencePredictor")
+        self.cache_k_shapes, self.cache_v_shapes = model.get_cache_kvs_shape(model.config, config.batch_size)
         BlockInferencePredictorMixin.__init__(self, config, tokenizer)
 
         cachekv_dtype = self.dtype if config.cachekv_int8_type is None else "uint8"
-        self.cache_kvs = [paddle.zeros(shape, dtype=cachekv_dtype) for shape in self.cache_kvs_shape]
+
+        self.cache_kvs = []
+        if self.cache_k_shapes and self.cache_v_shapes:
+            for cache_k_shape, cache_v_shape in zip(self.cache_k_shapes, self.cache_v_shapes):
+                self.cache_kvs.append(paddle.zeros(cache_k_shape, dtype=cachekv_dtype))
+                self.cache_kvs.append(paddle.zeros(cache_v_shape, dtype=cachekv_dtype))
+        else:
+            # for mla's absorption
+            assert self.cache_v_shapes is None
+            self.cache_kvs = [paddle.zeros(shape, dtype=cachekv_dtype) for shape in self.cache_k_shapes]
 
         self.model = model
 
@@ -1040,36 +1066,79 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
 
         self.model_inputs["cache_kvs"] = self.cache_kvs
 
+        # init speculate components
+        if config.speculate_method == "inference_with_reference":
+            self.proposer = InferenceWithReferenceProposer(
+                config.speculate_max_draft_token_num,
+                config.speculate_max_ngram_size,
+                config.batch_size,
+                config.max_length,
+            )
+        elif config.speculate_method in ["eagle", "mtp"]:
+            speculate_model_args = SpeculateArgument.build_from_predictor(config)
+            self.proposer = EagleProposer(args=speculate_model_args)
+        else:
+            self.proposer = None
+
     @paddle.no_grad()
     def _infer(self, inputs: dict[str, paddle.Tensor]):
-        self.model.generate(
+        return self.model.generate(
             **inputs,
         )
 
     @paddle.no_grad()
     def predict(self, input_texts: list[str], return_tokens=False):
         self._preprocess(input_texts)
-
+        if self.proposer is not None:
+            self.proposer.insert_query(
+                base_model_inputs=self.model_inputs, real_bs=len(input_texts), seq_lens=self.seq_lens
+            )
         result_queue = mp.Queue()
         tensor_queue = mp.Queue()
+        done_event = mp.Event()
 
-        output_tensor = paddle.full(shape=[MAX_BSZ + 2, 1], fill_value=2, dtype="int64")
-        output_tensor = output_tensor.cpu()
-        tensor_queue.put(output_tensor)
+        # whether speculative decoding
+        if self.proposer is None:
+            read_res_func = llm_utils.read_res
+            output_tensor_shape = [MAX_BSZ + 2, 1]
+        else:
+            read_res_func = llm_utils.speculate_read_res
+            output_tensor_shape = [MAX_BSZ * MAX_DRAFT_TOKENS + MAX_BSZ + 2, 1]
 
-        read_res_process = mp.Process(target=read_res, args=[self.model_name_or_path, tensor_queue, result_queue])
+        read_res_process = mp.Process(
+            target=read_res_func, args=[self.model_name_or_path, tensor_queue, result_queue, done_event]
+        )
         if self.tensor_parallel_rank == 0:
             read_res_process.start()
 
+        output_tensor = paddle.full(shape=output_tensor_shape, fill_value=2, dtype="int64").cpu()
+
+        tensor_queue.put(output_tensor)
+        if self.tensor_parallel_rank == 0:
+            done_event.wait()
         s_time = time.time()
         while self.model_inputs["not_need_stop"]:
-            self._infer(self.model_inputs)
-        logger.info(f"running spend {time.time()  -  s_time}")
+            # whether speculative decoding
+            if self.proposer is not None:
+                self.proposer.run(
+                    self.model_inputs,
+                    real_batch_size=self.batch_size,
+                    seq_lens_this_time=self.model_inputs["seq_lens_this_time"],
+                    base_model_full_hidden_states=self.full_hidden_states,
+                )
+            if self.return_full_hidden_states:
+                self.full_hidden_states = self._infer(self.model_inputs)
+            else:
+                self._infer(self.model_inputs)
+        logger.info(f"running spend {time.time() - s_time}")
+
+        if self.proposer is not None:
+            self.proposer.postprocess(base_model_inputs=self.model_inputs)
 
         if self.tensor_parallel_rank == 0:
             outputs = []
             output_tokens = []
-            while len(outputs) < self.batch_size:
+            while len(outputs) < len(input_texts):
                 result = result_queue.get(timeout=1)
                 outputs.append(result[-1])
                 output_tokens.append(result[-2])
@@ -1082,14 +1151,22 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
                 return outputs
 
 
-class StaticBlockInferencePredictor(BlockInferencePredictorMixin):
+class StaticGraphBlockInferencePredictor(BlockInferencePredictorMixin):
     def __init__(
         self,
         config: PredictorArgument,
-        cache_kvs_shape: list[list[int]],
         tokenizer: PretrainedTokenizer = None,
+        **kwargs,
     ):
-        self.cache_kvs_shape = cache_kvs_shape
+        self.cache_k_shapes = kwargs.get("cache_k_shapes", None)
+        self.cache_v_shapes = kwargs.get("cache_v_shapes", None)
+        self.model_args = kwargs.get("model_args", None)
+        self.return_full_hidden_states = config.return_full_hidden_states
+        self.full_hidden_states = None
+        if self.cache_k_shapes is None:
+            raise ValueError(
+                "cache_k_shapes and cache_v_shapes should be provided for StaticGraphBlockInferencePredictor"
+            )
         BlockInferencePredictorMixin.__init__(self, config, tokenizer)
 
         self._create_predictor(config)
@@ -1101,13 +1178,16 @@ class StaticBlockInferencePredictor(BlockInferencePredictorMixin):
                 self.model_inputs["pre_caches_{}".format(i)] = self.pre_caches[i]
 
         cachekv_dtype = config.dtype if config.cachekv_int8_type is None else "uint8"
-        for i in range(len(self.cache_kvs_shape) // 2):
-            self.model_inputs["key_caches_{}".format(i)] = paddle.zeros(
-                self.cache_kvs_shape[2 * i], dtype=cachekv_dtype
-            )
-            self.model_inputs["value_caches_{}".format(i)] = paddle.zeros(
-                self.cache_kvs_shape[2 * i + 1], dtype=cachekv_dtype
-            )
+
+        for i in range(self.num_layers):
+            if self.cache_k_shapes is not None:
+                self.model_inputs["key_caches_{}".format(i)] = paddle.zeros(
+                    self.cache_k_shapes[i], dtype=cachekv_dtype
+                )
+            if self.cache_v_shapes is not None:
+                self.model_inputs["value_caches_{}".format(i)] = paddle.zeros(
+                    self.cache_v_shapes[i], dtype=cachekv_dtype
+                )
 
         for i in range(self.num_layers):
             if self.config.cachekv_int8_type == "dynamic":
@@ -1116,6 +1196,20 @@ class StaticBlockInferencePredictor(BlockInferencePredictorMixin):
                 self.model_inputs["k_dequant_scales_" + str(i)] = self.k_dequant_scales[i]
                 self.model_inputs["v_dequant_scales_" + str(i)] = self.v_dequant_scales[i]
 
+        # init speculate components
+        if config.speculate_method == "inference_with_reference":
+            self.proposer = InferenceWithReferenceProposer(
+                config.speculate_max_draft_token_num,
+                config.speculate_max_ngram_size,
+                config.batch_size,
+                config.max_length,
+            )
+        elif config.speculate_method in ["eagle", "mtp"]:
+            speculate_model_args = SpeculateArgument.build_from_predictor(config)
+            self.proposer = EagleProposer(args=speculate_model_args)
+        else:
+            self.proposer = None
+
     def _create_predictor(self, predictor_args: PredictorArgument):
         if not is_paddlenlp_ops_available():
             raise ValueError(
@@ -1123,9 +1217,14 @@ class StaticBlockInferencePredictor(BlockInferencePredictorMixin):
                 "https://github.com/PaddlePaddle/PaddleNLP/blob/develop/csrc/README.md"
             )
 
-        infer_model_path = get_infer_model_path(predictor_args.model_name_or_path, predictor_args.model_prefix)
+        infer_model_path = llm_utils.get_infer_model_path(
+            predictor_args.model_name_or_path, predictor_args.model_prefix
+        )
 
-        config = paddle.inference.Config(infer_model_path + ".pdmodel", infer_model_path + ".pdiparams")
+        config = paddle.inference.Config(
+            infer_model_path + PADDLE_INFERENCE_MODEL_SUFFIX,
+            infer_model_path + PADDLE_INFERENCE_WEIGHTS_SUFFIX,
+        )
 
         config.switch_ir_optim(False)
         if predictor_args.device in paddle.device.get_all_custom_device_type():
@@ -1153,41 +1252,55 @@ class StaticBlockInferencePredictor(BlockInferencePredictorMixin):
             pass_builder = config.pass_builder()
             passes.addPasses(pass_builder, self.model_config.model_type, self.model_config.quant_type)
 
-        if self.tensor_parallel_degree > 1:
-            trainer_endpoints = fleet.worker_endpoints()
-            current_endpoint = trainer_endpoints[self.tensor_parallel_rank]
-
-            dist_config = config.dist_config()
-            dist_config.set_ranks(self.tensor_parallel_degree, self.tensor_parallel_rank)
-            dist_config.set_endpoints(trainer_endpoints, current_endpoint)
-            dist_config.enable_dist_model(True)
-
-            dist_config.set_comm_init_config(os.path.join(predictor_args.model_name_or_path, "rank_mapping.csv"))
-            config.set_dist_config(dist_config)
-
         self.predictor = paddle.inference.create_predictor(config)
 
     def predict(self, input_texts: list[str], return_tokens=False):
         s_time = time.time()
         self._preprocess(input_texts)
-        logger.info(f"preprocess spend {time.time()  -  s_time}")
+        if self.proposer is not None:
+            self.proposer.insert_query(
+                base_model_inputs=self.model_inputs, real_bs=len(input_texts), seq_lens=self.seq_lens
+            )
+        logger.info(f"preprocess spend {time.time() - s_time}")
 
         result_queue = mp.Queue()
         tensor_queue = mp.Queue()
+        done_event = mp.Event()
 
-        output_tensor = paddle.full(shape=[MAX_BSZ + 2, 1], fill_value=2, dtype="int64")
-        output_tensor = output_tensor.cpu()
-        tensor_queue.put(output_tensor)
+        # whether speculative decoding
+        if self.proposer is None:
+            read_res_func = llm_utils.read_res
+            output_tensor_shape = [MAX_BSZ + 2, 1]
+        else:
+            read_res_func = llm_utils.speculate_read_res
+            output_tensor_shape = [MAX_BSZ * MAX_DRAFT_TOKENS + MAX_BSZ + 2, 1]
 
-        read_res_process = mp.Process(target=read_res, args=[self.model_name_or_path, tensor_queue, result_queue])
-
+        read_res_process = mp.Process(
+            target=read_res_func, args=[self.model_name_or_path, tensor_queue, result_queue, done_event]
+        )
         if self.tensor_parallel_rank == 0:
             read_res_process.start()
 
+        output_tensor = paddle.full(shape=output_tensor_shape, fill_value=2, dtype="int64").cpu()
+
+        tensor_queue.put(output_tensor)
+        if self.tensor_parallel_rank == 0:
+            done_event.wait()
         s_time = time.time()
         while self.model_inputs["not_need_stop"]:
-            self.predictor.run(list(self.model_inputs.values()))
-        logger.info(f"running spend {time.time()  -  s_time}")
+            # whether speculative decoding
+            if self.proposer is not None:
+                self.proposer.run(
+                    self.model_inputs,
+                    real_batch_size=self.batch_size,
+                    seq_lens_this_time=self.model_inputs["seq_lens_this_time"],
+                    base_model_full_hidden_states=self.full_hidden_states,
+                )
+            if self.return_full_hidden_states:
+                self.full_hidden_states = self.predictor.run(list(self.model_inputs.values()))[0]
+            else:
+                self.predictor.run(list(self.model_inputs.values()))
+        logger.info(f"running spend {time.time() - s_time}")
 
         if self.tensor_parallel_rank == 0:
             outputs = []
@@ -1205,26 +1318,97 @@ class StaticBlockInferencePredictor(BlockInferencePredictorMixin):
                 return outputs
 
 
-def get_ptq_multicards_num(directory):
-    count = 0
-    prefix = "act_scales_"
-    for filename in os.listdir(directory):
-        if filename.startswith(prefix):
-            count += 1
-    return count
+class AutoPredictor:
+    def __init__(self, *args, **kwargs):
+        raise EnvironmentError(
+            f"{self.__class__.__name__} is designed to be instantiated "
+            f"using the `{self.__class__.__name__}.from_pretrained(pretrained_model_name_or_path).`"
+        )
+
+    @classmethod
+    def create_predictor(
+        cls,
+        predictor_args: PredictorArgument,
+        config: PretrainedConfig,
+        model_args: ModelArgument,
+        tokenizer: PretrainedTokenizer = None,
+        **kwargs,
+    ):
+        """
+        Create a predictor
+
+        Args:
+            predictor_args (PredictorArgument): The predictor arguments.
+            config (PretrainedConfig): The model configuration.
+            model_args (ModelArgument): The model arguments.
+            tokenizer (PretrainedTokenizer): The tokenizer.
+            **kwargs: Additional keyword arguments.
+        Returns:
+            Predictor: The predictor.
+        """
+        model = kwargs.pop("model", None)
+        cache_kvs_shape = None  # used for not block_attn/append_attn
+        cache_k_shapes = None  # used for block_attn/append_attn
+        cache_v_shapes = None  # used for block_attn/append_attn
+
+        # static or dynamic
+        execute_mode = "Dygraph" if predictor_args.mode == "dynamic" else "StaticGraph"
+
+        # infer/ no infer
+        if predictor_args.inference_model:
+            # block/no block
+            if predictor_args.block_attn:
+                attn_type = "Block"
+                if predictor_args.mode == "static":
+                    cache_k_shapes, cache_v_shapes = model.get_cache_kvs_shape(
+                        config, predictor_args.batch_size, predictor_args.total_max_length
+                    )
+            else:
+                attn_type = ""
+                if predictor_args.mode == "static":
+                    cache_kvs_shape = model.get_cache_kvs_shape(
+                        config, predictor_args.batch_size, predictor_args.total_max_length
+                    )
+            inference_mode = f"{attn_type}Inference"
+        else:
+            inference_mode = ""
+
+        predictor_class_name = execute_mode + inference_mode + "Predictor"
+
+        import_class = sys.modules[__name__]
+
+        # import class
+        predictor_class = getattr(import_class, predictor_class_name)
+
+        # instance
+        predictor = predictor_class(
+            predictor_args,
+            tokenizer=tokenizer,
+            model=model,
+            cache_k_shapes=cache_k_shapes,
+            cache_v_shapes=cache_v_shapes,
+            cache_kvs_shape=cache_kvs_shape,
+            model_args=model_args,
+        )
+        return predictor
 
 
 def create_predictor(
     predictor_args: PredictorArgument,
     model_args: ModelArgument,
-    tensor_parallel_degree: int = 1,
-    tensor_parallel_rank: int = 0,
 ):
+
+    paddle.set_device(predictor_args.device)
+    paddle.set_default_dtype(predictor_args.dtype)
+
+    from paddlenlp.utils.env import USE_FAST_TOKENIZER
+
     tokenizer = AutoTokenizer.from_pretrained(
-        predictor_args.model_name_or_path,
+        predictor_args.model_name_or_path, padding_side="left", use_fast=USE_FAST_TOKENIZER
     )
+
     # init chat_template for tokenizer
-    init_chat_template(tokenizer, predictor_args.model_name_or_path, predictor_args.chat_template)
+    llm_utils.init_chat_template(tokenizer, predictor_args.model_name_or_path, predictor_args.chat_template)
 
     # TODO(wj-Mcat): fix llama tokenzier pad_token bug
     if (isinstance(tokenizer, (LlamaTokenizer, Llama3Tokenizer))) and not tokenizer.pad_token:
@@ -1232,7 +1416,7 @@ def create_predictor(
 
     config = AutoConfig.from_pretrained(predictor_args.model_name_or_path)
 
-    max_position_embeddings = get_model_max_position_embeddings(config)
+    max_position_embeddings = llm_utils.get_model_max_position_embeddings(config)
     if max_position_embeddings is None:
         max_position_embeddings = predictor_args.src_length + predictor_args.max_length
         logger.warning(
@@ -1251,10 +1435,24 @@ def create_predictor(
         predictor_args.top_p = 0.0
         predictor_args.temperature = 1.0
 
-    tensor_parallel_rank, tensor_parallel_degree = init_dist_env()
-    if not predictor_args.inference_model:
-        tokenizer.padding_side = "left"
+    tensor_parallel_rank, tensor_parallel_degree = llm_utils.init_dist_env()
+
+    model = None
+
+    # model loading
+    if predictor_args.inference_model:
+        model = AutoInferenceModelForCausalLM.from_pretrained(
+            predictor_args.model_name_or_path,
+            config=config,
+            predictor_args=predictor_args,
+            model_args=model_args,
+            dtype=predictor_args.dtype,
+            tensor_parallel_degree=tensor_parallel_degree,
+            tensor_parallel_rank=tensor_parallel_rank,
+        )
+    else:
         if predictor_args.mode == "dynamic":
+            # model import (gpt-3,ernie) or AutoModel
             if model_args.model_type == "gpt-3":
                 sys.path.append("./gpt-3")
                 from modeling import GPTForCausalLM
@@ -1289,304 +1487,7 @@ def create_predictor(
                     tensor_parallel_output=False,
                 )
 
-            predictor = DygraphPredictor(predictor_args, model=model, tokenizer=tokenizer)
-        elif predictor_args.mode == "static":
-            predictor = StaticGraphPredictor(predictor_args, tokenizer=tokenizer)
-        else:
-            raise ValueError("the `mode` should be one of [dynamic, static]")
-    else:
-        if predictor_args.mode == "dynamic":
-            # TODO(wj-Mcat): complete AutoInferenceModel & AutoPredictor
-            config = AutoConfig.from_pretrained(predictor_args.model_name_or_path)
-            config.tensor_parallel_degree = tensor_parallel_degree
-            config.tensor_parallel_rank = tensor_parallel_rank
-            config.model_name_or_path = predictor_args.model_name_or_path
-            config.quant_type = predictor_args.quant_type
-            config.cachekv_int8_type = predictor_args.cachekv_int8_type
-            config.single_card_ptq = True
-            if predictor_args.avx_model:
-                config.avx_type = predictor_args.avx_type
-
-            if config.quantization_config.quant_type is not None:
-                predictor_args.quant_type = config.quantization_config.quant_type
-                config.quant_type = config.quantization_config.quant_type
-                if "c8" in config.quant_type:
-                    predictor_args.cachekv_int8_type = "static"
-                    config.cachekv_int8_type = "static"
-
-                ptq_multicards_num = get_ptq_multicards_num(config.model_name_or_path)
-                logger.info(f"PTQ from {ptq_multicards_num} cards, so we will not split")
-                if ptq_multicards_num > 1:
-                    config.single_card_ptq = False
-
-            if "llama" in config.architectures[0].lower():
-                if model_args.model_type == "llama-img2txt":
-                    # we use llama for img2txt.
-                    from paddlenlp.experimental.transformers import (
-                        LlamaForMiniGPT4InferenceModel as LlamaInferenceModel,
-                    )
-                elif predictor_args.block_attn:
-                    config.max_seq_len = predictor_args.total_max_length
-                    config.block_size = predictor_args.block_size
-                    from paddlenlp.experimental.transformers import (
-                        LlamaForCausalLMBlockInferenceModel as LlamaInferenceModel,
-                    )
-
-                    model = LlamaInferenceModel.from_pretrained(
-                        predictor_args.model_name_or_path,
-                        config=config,
-                        dtype=predictor_args.dtype,
-                        tensor_parallel_degree=tensor_parallel_degree,
-                        tensor_parallel_rank=tensor_parallel_rank,
-                    )
-                else:
-                    if predictor_args.device == "xpu":
-                        raise ValueError(
-                            "you should run xpu dynamic model with --block_attn flag"
-                            "https://github.com/PaddlePaddle/PaddleNLP/blob/develop/llm/docs/inference.md"
-                        )
-                    elif predictor_args.device == "cpu" and predictor_args.avx_model:
-                        from paddlenlp.experimental.transformers import (
-                            LlamaForCausalLMAvxInferenceModel as LlamaInferenceModel,
-                        )
-                    else:
-                        from paddlenlp.experimental.transformers import (
-                            LlamaForCausalLMInferenceModel as LlamaInferenceModel,
-                        )
-
-                    model = LlamaInferenceModel.from_pretrained(
-                        predictor_args.model_name_or_path,
-                        config=config,
-                        dtype=predictor_args.dtype,
-                    )
-                model.eval()
-
-            elif "opt" in config.architectures[0].lower():
-                if model_args.model_type == "opt-img2txt":
-                    # we use opt for img2txt.
-                    from paddlenlp.experimental.transformers import (
-                        OPTForBlip2InferenceModel as OPTInferenceModel,
-                    )
-                else:
-                    from paddlenlp.experimental.transformers import (
-                        OPTForCausalLMInferenceModel as OPTInferenceModel,
-                    )
-
-                model = OPTInferenceModel.from_pretrained(
-                    predictor_args.model_name_or_path, config=config, dtype=predictor_args.dtype
-                )
-                model.eval()
-
-            elif "chatglmv2forcausallm" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    ChatGLMv2ForCausalLMInferenceModel as Model,
-                )
-
-                model = Model.from_pretrained(
-                    predictor_args.model_name_or_path, config=config, dtype=predictor_args.dtype
-                )
-                model.eval()
-            elif "chatglmforcausallm" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    ChatGLMForCausalLMInferenceModel,
-                )
-
-                model = ChatGLMForCausalLMInferenceModel.from_pretrained(
-                    predictor_args.model_name_or_path,
-                    config=config,
-                    dtype=predictor_args.dtype,
-                )
-                model.eval()
-            elif "bloom" in config.architectures[0].lower():
-                if predictor_args.block_attn:
-                    from paddlenlp.experimental.transformers import (
-                        BlommForCausalBlockLMInferenceModel as BloomInferenceModel,
-                    )
-
-                    config.block_size = predictor_args.block_size
-                    config.max_seq_len = predictor_args.total_max_length
-                else:
-                    from paddlenlp.experimental.transformers import (
-                        BloomForCausalLMInferenceModel as BloomInferenceModel,
-                    )
-                model = BloomInferenceModel.from_pretrained(
-                    predictor_args.model_name_or_path,
-                    config=config,
-                    dtype=predictor_args.dtype,
-                )
-                cache_kvs_shape = BloomInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-                model.eval()
-            elif "gpt" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    GPTForCausalLMInferenceModel,
-                )
-
-                model = GPTForCausalLMInferenceModel.from_pretrained(
-                    predictor_args.model_name_or_path,
-                    config=config,
-                    dtype=predictor_args.dtype,
-                )
-                model.eval()
-            elif "qwen2" in config.architectures[0].lower():
-                if predictor_args.block_attn:
-                    config.max_seq_len = predictor_args.total_max_length
-                    config.block_size = predictor_args.block_size
-                    from paddlenlp.experimental.transformers import (
-                        Qwen2ForCausalLMBlockInferenceModel as Qwen2InferenceModel,
-                    )
-
-                    model = Qwen2InferenceModel.from_pretrained(
-                        predictor_args.model_name_or_path,
-                        config=config,
-                        dtype=predictor_args.dtype,
-                        tensor_parallel_degree=tensor_parallel_degree,
-                        tensor_parallel_rank=tensor_parallel_rank,
-                    )
-                else:
-                    from paddlenlp.experimental.transformers import (
-                        Qwen2ForCausalLMInferenceModel as Qwen2InferenceModel,
-                    )
-
-                    model = Qwen2InferenceModel.from_pretrained(
-                        predictor_args.model_name_or_path,
-                        config=config,
-                        dtype=predictor_args.dtype,
-                    )
-                model.eval()
-            elif "qwen" in config.architectures[0].lower():
-                if model_args.model_type == "qwen-img2txt":
-                    # we use qwen for img2txt.
-                    from paddlenlp.experimental.transformers import (
-                        QWenForQWenVLInferenceModel as QWenInferenceModel,
-                    )
-                else:
-                    from paddlenlp.experimental.transformers import (
-                        QWenForCausalLMInferenceModel as QWenInferenceModel,
-                    )
-                model = QWenInferenceModel.from_pretrained(
-                    predictor_args.model_name_or_path,
-                    config=config,
-                    dtype=predictor_args.dtype,
-                )
-                model.eval()
-            else:
-                raise ValueError("the `model type` should be one of [llama, chatglm, bloom, gpt, qwen]")
-            if predictor_args.block_attn:
-                predictor = DygraphBlockInferencePredictor(predictor_args, model=model, tokenizer=tokenizer)
-            else:
-                predictor = DygraphInferencePredictor(predictor_args, model=model, tokenizer=tokenizer)
-
-        elif predictor_args.mode == "static":
-            config = AutoConfig.from_pretrained(predictor_args.model_name_or_path)
-            config.quant_type = predictor_args.quant_type
-            config.cachekv_int8_type = predictor_args.cachekv_int8_type
-
-            if config.quantization_config.quant_type is not None:
-                predictor_args.quant_type = config.quantization_config.quant_type
-                config.quant_type = config.quantization_config.quant_type
-                if "c8" in config.quant_type:
-                    predictor_args.cachekv_int8_type = "static"
-                    config.cachekv_int8_type = "static"
-
-            if "llama" in config.architectures[0].lower():
-                if predictor_args.block_attn:
-                    config.block_size = predictor_args.block_size
-                    config.max_seq_len = predictor_args.total_max_length
-                    from paddlenlp.experimental.transformers import (
-                        LlamaForCausalLMBlockInferenceModel as LlamaInferenceModel,
-                    )
-                elif predictor_args.avx_model and predictor_args.device == "cpu":
-                    from paddlenlp.experimental.transformers import (
-                        LlamaForCausalLMAvxInferenceModel as LlamaInferenceModel,
-                    )
-                else:
-                    from paddlenlp.experimental.transformers import (
-                        LlamaForCausalLMInferenceModel as LlamaInferenceModel,
-                    )
-
-                cache_kvs_shape = LlamaInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-            elif "chatglmv2forcausallm" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    ChatGLMv2ForCausalLMInferenceModel,
-                )
-
-                cache_kvs_shape = ChatGLMv2ForCausalLMInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-            elif "chatglmv2forcausallm" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    ChatGLMv2ForCausalLMInferenceModel,
-                )
-
-                cache_kvs_shape = ChatGLMv2ForCausalLMInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-            elif "chatglmforcausallm" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    ChatGLMForCausalLMInferenceModel,
-                )
-
-                cache_kvs_shape = ChatGLMForCausalLMInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-            elif "bloom" in config.architectures[0].lower():
-                if predictor_args.block_attn:
-                    from paddlenlp.experimental.transformers import (
-                        BlommForCausalBlockLMInferenceModel as BloomInferenceModel,
-                    )
-
-                    config.block_size = predictor_args.block_size
-                    config.max_seq_len = predictor_args.total_max_length
-                else:
-                    from paddlenlp.experimental.transformers import (
-                        BloomForCausalLMInferenceModel as BloomInferenceModel,
-                    )
-                cache_kvs_shape = BloomInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-            elif "gpt" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    GPTForCausalLMInferenceModel,
-                )
-
-                cache_kvs_shape = GPTForCausalLMInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-            elif "qwen2" in config.architectures[0].lower():
-                if predictor_args.block_attn:
-                    config.block_size = predictor_args.block_size
-                    config.max_seq_len = predictor_args.total_max_length
-                    from paddlenlp.experimental.transformers import (
-                        Qwen2ForCausalLMBlockInferenceModel as Qwen2InferenceModel,
-                    )
-                else:
-                    from paddlenlp.experimental.transformers import (
-                        Qwen2ForCausalLMInferenceModel as Qwen2InferenceModel,
-                    )
-                cache_kvs_shape = Qwen2InferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-
-            elif "qwen" in config.architectures[0].lower():
-                from paddlenlp.experimental.transformers import (
-                    QWenForCausalLMInferenceModel,
-                )
-
-                cache_kvs_shape = QWenForCausalLMInferenceModel.get_cache_kvs_shape(
-                    config, predictor_args.batch_size, predictor_args.total_max_length
-                )
-            else:
-                raise ValueError("the `model type` should be one of [llama, chatglm, bloom, gpt, qwen]")
-            if predictor_args.block_attn:
-                predictor = StaticBlockInferencePredictor(predictor_args, cache_kvs_shape, tokenizer=tokenizer)
-            else:
-                predictor = StaticInferencePredictor(predictor_args, cache_kvs_shape, tokenizer=tokenizer)
-        else:
-            raise ValueError("the `mode` should be one of [dynamic, static]")
+    predictor = AutoPredictor.create_predictor(predictor_args, config, model_args, tokenizer, model=model)
 
     return predictor
 
@@ -1594,9 +1495,6 @@ def create_predictor(
 def predict():
     parser = PdArgumentParser((PredictorArgument, ModelArgument))
     predictor_args, model_args = parser.parse_args_into_dataclasses()
-
-    paddle.set_device(predictor_args.device)
-    paddle.set_default_dtype(predictor_args.dtype)
 
     tensor_parallel_degree = paddle.distributed.get_world_size()
     if tensor_parallel_degree > 1:
@@ -1630,7 +1528,9 @@ def predict():
                     target_texts.append("")
 
     else:
-        source_texts = ["解释一下温故而知新"] * predictor_args.batch_size
+        source_texts = [
+            "2014年3月，大范围雾霾天气长时间影响我国东部地区，严重危害人体健康。造成雾霾天气的人为原因有____\r\n①工业生产中使用矿物作为燃料，大量排放污染物     ②汽车尾气的大量排放     \r\n③风力小，空气流动不畅     ④冬季取暖排放粉尘\nA. ①②③\nB. ②③④\nC. ①③④\nD. ①②④"
+        ] * predictor_args.batch_size
         target_texts = [""] * predictor_args.batch_size
 
     batch_source_texts = batchfy_text(source_texts, predictor_args.batch_size)
@@ -1666,8 +1566,8 @@ def benchmark(predictor, predictor_args, model_args):
     batch_benchmark_texts = batchfy_text(benchmark_texts, predictor_args.batch_size)
     print("***********Start Benchmark**********")
 
-    warmup_time = 10
-    test_time = 100
+    warmup_time = 5
+    test_time = 20
 
     print("***********Start Warmup**********")
     for _ in range(warmup_time):

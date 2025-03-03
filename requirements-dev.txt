@@ -28,3 +28,5 @@ loguru
 data
 wget
 huggingface_hub>=0.19.2
+tiktoken
+tokenizers>=0.21,<0.22

@@ -29,7 +29,7 @@ from paddlenlp.utils.download import resolve_file_path
 # TODO(fangzeyang) Temporary fix and replace by paddle framework downloader later
 from paddlenlp.utils.log import logger
 
-__all__ = ["FasterPretrainedModel", "ActScalesLoader", "WeightScalesLoader"]
+__all__ = ["FasterPretrainedModel", "ActScalesLoader", "WeightScalesLoader", "PerTensorWeightScalesLoader"]
 
 
 def load_vocabulary(filepath):
@@ -332,7 +332,7 @@ class ActScalesLoader:
         self.key_map = key_map_dict
         self.scale = {}
         for scale_type, key_template in self.key_map.items():
-            self.scale[scale_type] = np.full([num_of_layers], fill_value=-1.0)
+            self.scale[scale_type] = np.full([num_of_layers], fill_value=-1.0, dtype="float32")
             for i in range(num_of_layers):
                 if key_template.replace("#", str(i)) in self.scale_dict.keys():
                     self.scale[scale_type][i] = 1 / self.scale_dict[key_template.replace("#", str(i))]
@@ -389,6 +389,47 @@ class WeightScalesLoader:
                 )
 
 
+class PerTensorWeightScalesLoader:
+    """
+    Load Per Tensor Weight Scale from json file
+    """
+
+    def __init__(
+        self,
+        scale_json_file_path="weight_scales.json",
+        key_map_dict=None,
+        num_of_layers=None,
+    ):
+        """load weight scales from json file."""
+        with open(scale_json_file_path) as json_file:
+            self.scale_dict = json.load(json_file)
+        self.key_map = key_map_dict
+        self.scale = {}
+        for scale_type, key_template in self.key_map.items():
+            no_skip_layer_list = []
+            scale_shape = [1]
+            for i in range(num_of_layers):
+                if key_template.replace("#", str(i)) in self.scale_dict.keys():
+                    no_skip_layer_list.append(key_template.replace("#", str(i)))
+            if len(no_skip_layer_list) > 0:
+                scale_shape = np.array(self.scale_dict[no_skip_layer_list[0]]).shape
+
+            self.scale[scale_type] = np.full(((num_of_layers,) + tuple(scale_shape)), fill_value=-1.0)
+            for i in range(num_of_layers):
+                if key_template.replace("#", str(i)) in self.scale_dict.keys():
+                    self.scale[scale_type][i] = self.scale_dict[key_template.replace("#", str(i))]
+
+        if "qkv_weight_scale" not in self.scale.keys():
+            self.scale["qkv_weight_scale"] = np.full((num_of_layers), fill_value=-1.0).astype(np.float32)
+            for i in range(num_of_layers):
+                qkv_weight_scale = max(
+                    abs(self.scale["q_weight_scale"][i]),
+                    abs(self.scale["k_weight_scale"][i]),
+                    abs(self.scale["v_weight_scale"][i]),
+                )
+                self.scale["qkv_weight_scale"][i] = qkv_weight_scale
+
+
 class CacheScaleLoader:
     def __init__(
         self,
@@ -425,3 +466,53 @@ class CacheScaleLoader:
                     self.scale[scale_type_out][i, :] = [
                         1.0 / self.scale[scale_type][i, j] for j in range(0, num_key_value_heads)
                     ]
+
+
+def get_dequant_weight(w, w_s=None, dtype=None, weight_block_size=[128, 128]):
+    if w_s is None:
+        return w
+
+    assert weight_block_size == [128, 128]
+    from paddlenlp_ops import group_quant
+
+    try:
+        from paddlenlp_ops import (
+            cutlass_fp8_fp8_half_block_gemm_fused as fp8_block_gemm_fused,
+        )
+    except:
+        assert False, "fp8_block_gemm_fused only supported on sm90"
+
+    eye = paddle.eye(w.shape[0], dtype=paddle.float32)
+    x_q, x_s = group_quant(
+        eye, group_size=weight_block_size[1], transpose_scale=True, quant_max_bound=448.0, quant_min_bound=-448.0
+    )
+    out = fp8_block_gemm_fused(
+        x_q,
+        w.t(),
+        x_s,
+        w_s.t(),
+        bias=None,
+        transpose_x=False,
+        transpose_y=True,
+        output_dtype=dtype,
+        act="identity",
+    )
+    return out
+
+
+def cell_div(x, y):
+    return (x + y - 1) // y
+
+
+def block_quant_to_fp8(x: paddle.Tensor, weight_block_size=[128, 128], eps=1e-6):
+    assert weight_block_size == [128, 128]
+    assert x.ndim == 2
+    m, n = x.shape
+    x_padded = paddle.zeros((cell_div(m, 128) * 128, cell_div(n, 128) * 128), dtype=x.dtype)
+    x_padded[:m, :n] = x
+    x_view = x_padded.view([-1, 128, x_padded.shape[1] // 128, 128])
+    x_amax = x_view.cast(paddle.float32).abs().max(axis=[1, 3], keepdim=True).clip(min=eps)
+    x_scaled = (x_view * (448.0 / x_amax)).to(paddle.float8_e4m3fn)
+    x_q = x_scaled.view_as(x_padded)[:m, :n].contiguous()
+    x_s = (x_amax / 448.0).view([x_view.shape[0], x_view.shape[2]])
+    return x_q.cast(paddle.float8_e4m3fn), x_s
